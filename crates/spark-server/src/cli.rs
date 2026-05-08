@@ -147,6 +147,18 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8)]
     pub max_batch_size: usize,
 
+    /// MoE active expert policy. Default keeps the model config unchanged.
+    /// `fixed` enables `--moe-top-k-override` for training-free active
+    /// expert budget ablations.
+    #[arg(long, default_value = "model-config")]
+    pub moe_top_k_policy: String,
+
+    /// Override the model config's MoE top-k experts per token at startup.
+    /// Requires `--moe-top-k-policy fixed`. Default `None` preserves the
+    /// checkpoint/config value exactly.
+    #[arg(long)]
+    pub moe_top_k_override: Option<usize>,
+
     /// MTP head weight precision: nvfp4 (fastest, recommended — uses fused
     /// device-side expert dispatch), fp8 (balanced but slower due to D2H sync
     /// in MoE), bf16 (highest accuracy, most memory).

@@ -53,6 +53,49 @@ pub(crate) fn load_model_config(model_dir: &Path) -> Result<(ModelConfig, String
     Ok((config, config_json))
 }
 
+pub(crate) fn apply_moe_top_k_override(
+    args: &cli::ServeArgs,
+    config: &mut ModelConfig,
+) -> Result<()> {
+    let Some(override_top_k) = args.moe_top_k_override else {
+        if args.moe_top_k_policy != "model-config" {
+            anyhow::bail!(
+                "--moe-top-k-policy={} requires --moe-top-k-override; use the default policy to preserve model config",
+                args.moe_top_k_policy,
+            );
+        }
+        return Ok(());
+    };
+
+    if args.moe_top_k_policy != "fixed" {
+        anyhow::bail!(
+            "--moe-top-k-override requires --moe-top-k-policy fixed (got '{}')",
+            args.moe_top_k_policy,
+        );
+    }
+    if config.num_experts == 0 {
+        anyhow::bail!("--moe-top-k-override was set, but model config has num_experts=0");
+    }
+    if override_top_k == 0 || override_top_k > config.num_experts {
+        anyhow::bail!(
+            "--moe-top-k-override must be in 1..={} for this model (got {})",
+            config.num_experts,
+            override_top_k,
+        );
+    }
+
+    let default_top_k = config.num_experts_per_tok;
+    config.num_experts_per_tok = override_top_k;
+    tracing::info!(
+        "MoE top-k policy: fixed override active (default_top_k={}, override_top_k={}, num_experts={}, norm_topk_prob={})",
+        default_top_k,
+        override_top_k,
+        config.num_experts,
+        config.norm_topk_prob,
+    );
+    Ok(())
+}
+
 pub(crate) fn resolve_model_dir(args: &cli::ServeArgs) -> Result<std::path::PathBuf> {
     use crate::model_resolver;
     if let Some(ref path) = args.model_from_path {
