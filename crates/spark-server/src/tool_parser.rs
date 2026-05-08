@@ -342,6 +342,7 @@ impl ToolCallFormat {
 
 // ── Sub-modules (split from monolithic file) ──
 mod bare_json;
+mod fuzzy_match;
 mod gemma4;
 mod helpers_a;
 mod helpers_b;
