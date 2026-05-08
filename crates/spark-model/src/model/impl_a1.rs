@@ -53,6 +53,7 @@ impl TransformerModel {
         ssm_checkpoint_interval: usize,
     ) -> Result<Self> {
         let fp32_residual = config.use_fp32_residual();
+        crate::moe_block_policy::init_from_env(config.num_hidden_layers, fp32_residual)?;
         let rms_norm_kernel = if fp32_residual {
             gpu.kernel("norm", "rms_norm_f32")
                 .or_else(|_| gpu.kernel("norm", "rms_norm"))?

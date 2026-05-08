@@ -61,6 +61,10 @@ impl FfnComponent {
         matches!(self, Self::None)
     }
 
+    pub fn is_moe(&self) -> bool {
+        matches!(self, Self::Moe(_))
+    }
+
     pub fn forward(
         &self,
         input: DevicePtr,

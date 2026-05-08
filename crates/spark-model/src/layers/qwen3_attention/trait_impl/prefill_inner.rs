@@ -222,14 +222,28 @@ impl Qwen3AttentionLayer {
         )
         .map_err(|e| anyhow::anyhow!("residual_add_rms_norm failed: n={n} h={h}: {e}"))?;
 
-        self.ffn
-            .forward_prefill(ctx.buffers.norm_output(), num_tokens, ctx, stream)
-            .map_err(|e| anyhow::anyhow!("ffn.forward_prefill failed: {e}"))?;
+        let policy_out = if self.moe_block_policy().is_some() {
+            Some(
+                self.apply_moe_block_prefill(
+                    hidden,
+                    ctx.buffers.norm_output(),
+                    num_tokens,
+                    ctx,
+                    stream,
+                )
+                .map_err(|e| anyhow::anyhow!("moe block policy failed: {e}"))?,
+            )
+        } else {
+            self.ffn
+                .forward_prefill(ctx.buffers.norm_output(), num_tokens, ctx, stream)
+                .map_err(|e| anyhow::anyhow!("ffn.forward_prefill failed: {e}"))?;
+            None
+        };
 
-        let dense_out = ctx.buffers.moe_output();
+        let dense_out = policy_out.unwrap_or_else(|| ctx.buffers.moe_output());
 
         // DIAGNOSTIC: MoE output for L0 and L35
-        if is_mistral_diag {
+        if is_mistral_diag && !dense_out.is_null() {
             diag_norm(
                 ctx.gpu,
                 dense_out,
@@ -240,7 +254,10 @@ impl Qwen3AttentionLayer {
         }
 
         // Gemma-4 26B MoE dual FFN (prefill): match HF Gemma4TextDecoderLayer.forward
-        if let (Some(moe_ffn), Some(_pre_norm), Some(post_norm), Some(dense_norm)) = (
+        if policy_out.is_some() {
+            // MoE block policy helper already applied or intentionally skipped
+            // the FFN residual contribution.
+        } else if let (Some(moe_ffn), Some(_pre_norm), Some(post_norm), Some(dense_norm)) = (
             &self.moe_ffn,
             &self.pre_moe_norm,
             &self.post_moe_out_norm,

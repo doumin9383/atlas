@@ -17,6 +17,7 @@
 mod decode;
 mod helpers;
 mod init;
+mod moe_block;
 mod prefill;
 mod prefill_weights;
 mod trait_impl;

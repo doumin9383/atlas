@@ -338,6 +338,7 @@ impl Qwen3AttentionLayer {
             } else {
                 gpu.kernel("residual_add", "bf16_residual_add")?
             },
+            scaled_add_k: super::super::try_kernel(gpu, "residual_add", "bf16_scaled_add"),
             // Gemma-4 rms-norm uses the absolute formula `out = x * rms * w`.
             rms_norm_f32_in_k: if config.use_fp32_residual() && config.model_type == "gemma4" {
                 super::super::try_kernel(gpu, "norm", "rms_norm_f32_in_abs")

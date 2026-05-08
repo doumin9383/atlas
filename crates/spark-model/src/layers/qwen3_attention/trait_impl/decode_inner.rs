@@ -167,19 +167,32 @@ impl Qwen3AttentionLayer {
                 eps,
                 stream,
             )?;
-            let moe_out = self.ffn.forward(normed2, ctx, stream)?;
+            if self.moe_block_policy().is_some() {
+                self.apply_moe_block_decode(hidden, normed2, ctx, stream)?;
+            } else {
+                let moe_out = self.ffn.forward(normed2, ctx, stream)?;
 
-            // Gemma-4: post-FFN norm
-            if let Some(ref post_norm) = self.post_ffn_out_norm {
-                ops::rms_norm(
+                // Gemma-4: post-FFN norm
+                if let Some(ref post_norm) = self.post_ffn_out_norm {
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_k,
+                        moe_out,
+                        post_norm,
+                        moe_out,
+                        1,
+                        h as u32,
+                        eps,
+                        stream,
+                    )?;
+                }
+
+                ops::residual_add(
                     ctx.gpu,
-                    self.rms_norm_k,
+                    self.residual_add_k,
+                    hidden,
                     moe_out,
-                    post_norm,
-                    moe_out,
-                    1,
                     h as u32,
-                    eps,
                     stream,
                 )?;
             }
@@ -188,14 +201,6 @@ impl Qwen3AttentionLayer {
             let moe_us = t0.elapsed().as_micros();
             tracing::info!("  Attn-MoE: {:.1}ms", moe_us as f64 / 1000.0);
 
-            ops::residual_add(
-                ctx.gpu,
-                self.residual_add_k,
-                hidden,
-                moe_out,
-                h as u32,
-                stream,
-            )?;
             // Gemma-4: hidden *= layer_scalar at end of layer
             if let Some(scalar) = self.layer_scalar {
                 self.apply_layer_scalar(
@@ -316,46 +321,59 @@ impl Qwen3AttentionLayer {
                     &format!("L{:02} normed2", self.attn_layer_idx),
                 );
             }
-            let dense_out = self.ffn.forward(normed2, ctx, stream)?;
-            if gemma4_diag {
-                diag_norm(
-                    ctx.gpu,
-                    dense_out,
-                    h,
-                    stream,
-                    &format!("L{:02} dense_out", self.attn_layer_idx),
-                );
-            }
-            if let Some(ref post_norm) = self.post_ffn_out_norm {
-                ops::rms_norm(
-                    ctx.gpu,
-                    self.rms_norm_k,
-                    dense_out,
-                    post_norm,
-                    dense_out,
-                    1,
-                    h as u32,
-                    eps,
-                    stream,
-                )?;
+            if self.moe_block_policy().is_some() {
+                self.apply_moe_block_decode(hidden, normed2, ctx, stream)?;
+                if gemma4_diag {
+                    diag_hidden(
+                        ctx.gpu,
+                        hidden,
+                        h,
+                        stream,
+                        &format!("L{:02} moe_policy_hidden", self.attn_layer_idx),
+                    );
+                }
+            } else {
+                let dense_out = self.ffn.forward(normed2, ctx, stream)?;
                 if gemma4_diag {
                     diag_norm(
                         ctx.gpu,
                         dense_out,
                         h,
                         stream,
-                        &format!("L{:02} post_ffn_normed", self.attn_layer_idx),
+                        &format!("L{:02} dense_out", self.attn_layer_idx),
                     );
                 }
+                if let Some(ref post_norm) = self.post_ffn_out_norm {
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_k,
+                        dense_out,
+                        post_norm,
+                        dense_out,
+                        1,
+                        h as u32,
+                        eps,
+                        stream,
+                    )?;
+                    if gemma4_diag {
+                        diag_norm(
+                            ctx.gpu,
+                            dense_out,
+                            h,
+                            stream,
+                            &format!("L{:02} post_ffn_normed", self.attn_layer_idx),
+                        );
+                    }
+                }
+                ops::residual_add(
+                    ctx.gpu,
+                    self.residual_add_k,
+                    hidden,
+                    dense_out,
+                    h as u32,
+                    stream,
+                )?;
             }
-            ops::residual_add(
-                ctx.gpu,
-                self.residual_add_k,
-                hidden,
-                dense_out,
-                h as u32,
-                stream,
-            )?;
         }
 
         if gemma4_diag {

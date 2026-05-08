@@ -23,6 +23,7 @@ pub mod layer;
 pub mod layers;
 pub mod mistral_loader;
 pub mod model;
+pub mod moe_block_policy;
 pub mod precision_schedule;
 pub mod preflight;
 pub mod quant_format;

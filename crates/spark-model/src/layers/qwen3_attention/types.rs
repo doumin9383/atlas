@@ -182,6 +182,7 @@ pub struct Qwen3AttentionLayer {
     pub(super) paged_decode_splitk_k: Option<KernelHandle>,
     pub(super) paged_decode_reduce_k: Option<KernelHandle>,
     pub(super) residual_add_k: KernelHandle,
+    pub(super) scaled_add_k: KernelHandle,
     pub(super) sigmoid_gate_mul_k: KernelHandle,
     pub(super) deinterleave_qg_k: KernelHandle,
     pub(super) w4a16_gemv_qg_k: KernelHandle,
