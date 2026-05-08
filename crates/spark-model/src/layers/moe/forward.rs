@@ -147,6 +147,7 @@ impl MoeLayer {
                 }
             })?;
         }
+        self.maybe_log_router_stats(indices_dev, weights_dev, 1, top_k, ctx, stream);
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             ctx.gpu.synchronize(stream)?;

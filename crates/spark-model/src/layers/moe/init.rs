@@ -229,6 +229,7 @@ impl MoeLayer {
             fp8_shared_expert: None,
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
+            layer_idx: 0,
             correction_bias_dev: weights_correction_bias,
             // `moe_topk_sig` is only registered for sigmoid-gated MoE models
             // (MiniMax-M2, Nemotron-Nano, Nemotron-Super). Softmax-gated MoEs

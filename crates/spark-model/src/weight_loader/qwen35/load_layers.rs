@@ -158,6 +158,7 @@ pub(super) fn load_layers(
         // capture-layer indices are already offset-adjusted in factory.rs
         // before being placed on `config.dflash_capture_layers`.
         moe_layer.is_dflash_capture_layer = config.dflash_capture_layers.contains(&i);
+        moe_layer.layer_idx = i;
         // With native FP8, the FP8 fused MoE kernel handles both prefill and decode.
         // Skip transposition and predequant (saves ~30 GB + CPU time for 122B EP=2).
         if !native_fp8 && !skip_moe_transpose {

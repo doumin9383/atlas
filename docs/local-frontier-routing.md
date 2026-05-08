@@ -12,6 +12,12 @@ New `spark serve` flags:
 --moe-top-k-override <N>
 ```
 
+Environment override:
+
+```text
+ATLAS_MOE_TOP_K_OVERRIDE=<N>
+```
+
 Behavior:
 
 - Default policy is `model-config`, preserving the checkpoint/config value.
@@ -19,6 +25,7 @@ Behavior:
 - `N` must be in `1..=num_experts`.
 - The override mutates `ModelConfig.num_experts_per_tok` before memory preflight, buffer sizing, model build, and MoE dispatch.
 - Startup logs include default top-k, override top-k, expert count, and `norm_topk_prob`.
+- Env override is treated as a fixed policy and is intended for experiment manifests.
 
 Initial experiment ladder:
 
@@ -35,19 +42,33 @@ Initial experiment ladder:
 - `spark serve --help` shows both flags.
 - DGX Spark smoke test with default config and with A6 override.
 
-## Next Patch: Router Entropy Logging
+## Implemented: Router Entropy / Selection Summary Logging
 
-Add logging-only flags:
+Logging-only environment flags:
 
 ```text
---moe-router-entropy-summary
---moe-router-logits-dump /results/router.jsonl
+ATLAS_MOE_ROUTER_STATS=1
+ATLAS_MOE_ROUTER_STATS_PATH=/results/router_stats.jsonl
+ATLAS_MOE_ROUTER_STATS_MAX_TOKENS=4
 ```
 
 Constraints:
 
-- No behavior change.
-- Prefer summaries over full logits by default.
-- Bound the token/layer volume to avoid large host sync overhead.
-- Write JSONL records suitable for benchmark metadata joins.
+- No behavior change when disabled.
+- Summaries only; full logits dump is intentionally deferred.
+- Token/layer volume is bounded by `ATLAS_MOE_ROUTER_STATS_MAX_TOKENS`.
+- Stats are written after top-k selection from selected expert ids and selected gate weights.
+- Decode stats are skipped during CUDA graph capture; prefill stats are the first useful target.
 
+JSONL fields:
+
+- `timestamp`
+- `request_id` (`null` until request metadata is wired into `ForwardContext`)
+- `layer`
+- `token_index`
+- `top_k`
+- `selected_expert_ids`
+- `selected_gate_scores`
+- `entropy`
+- `max_prob`
+- `margin_top1_top2`

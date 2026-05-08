@@ -57,7 +57,24 @@ pub(crate) fn apply_moe_top_k_override(
     args: &cli::ServeArgs,
     config: &mut ModelConfig,
 ) -> Result<()> {
-    let Some(override_top_k) = args.moe_top_k_override else {
+    let env_override = match std::env::var("ATLAS_MOE_TOP_K_OVERRIDE") {
+        Ok(raw) if !raw.trim().is_empty() => Some(
+            raw.trim()
+                .parse::<usize>()
+                .with_context(|| format!("Invalid ATLAS_MOE_TOP_K_OVERRIDE value '{raw}'"))?,
+        ),
+        _ => None,
+    };
+    let override_top_k = args.moe_top_k_override.or(env_override);
+
+    if args.moe_top_k_policy != "model-config" && args.moe_top_k_policy != "fixed" {
+        anyhow::bail!(
+            "Unknown --moe-top-k-policy '{}'. Supported: model-config, fixed",
+            args.moe_top_k_policy,
+        );
+    }
+
+    let Some(override_top_k) = override_top_k else {
         if args.moe_top_k_policy != "model-config" {
             anyhow::bail!(
                 "--moe-top-k-policy={} requires --moe-top-k-override; use the default policy to preserve model config",
@@ -67,7 +84,8 @@ pub(crate) fn apply_moe_top_k_override(
         return Ok(());
     };
 
-    if args.moe_top_k_policy != "fixed" {
+    let env_forced = args.moe_top_k_override.is_none();
+    if args.moe_top_k_policy != "fixed" && !env_forced {
         anyhow::bail!(
             "--moe-top-k-override requires --moe-top-k-policy fixed (got '{}')",
             args.moe_top_k_policy,
@@ -87,7 +105,8 @@ pub(crate) fn apply_moe_top_k_override(
     let default_top_k = config.num_experts_per_tok;
     config.num_experts_per_tok = override_top_k;
     tracing::info!(
-        "MoE top-k policy: fixed override active (default_top_k={}, override_top_k={}, num_experts={}, norm_topk_prob={})",
+        "MoE top-k policy: fixed override active (source={}, default_top_k={}, override_top_k={}, num_experts={}, norm_topk_prob={})",
+        if env_forced { "env" } else { "cli" },
         default_top_k,
         override_top_k,
         config.num_experts,

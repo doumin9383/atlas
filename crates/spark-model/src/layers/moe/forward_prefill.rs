@@ -201,6 +201,7 @@ impl MoeLayer {
             )?;
         }
         prof_step!("topk");
+        self.maybe_log_router_stats(indices_dev, weights_dev, n, top_k, ctx, stream);
 
         // 3. Sort tokens by expert → L2-optimized ordering.
         let te = total_expanded as usize;

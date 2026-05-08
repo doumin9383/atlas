@@ -244,6 +244,8 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
+    /// Transformer layer index. Used only for opt-in router stats logging.
+    pub layer_idx: usize,
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
@@ -260,6 +262,7 @@ mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod init;
+mod router_stats;
 
 /// Build a device-side pointer table from pre-transposed QuantizedWeight vec.
 fn build_ptr_table_from_qw(
