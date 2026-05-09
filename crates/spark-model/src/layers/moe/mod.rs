@@ -263,6 +263,7 @@ mod helpers_b;
 mod helpers_c;
 mod init;
 mod router_stats;
+mod weighted_rerank;
 
 /// Build a device-side pointer table from pre-transposed QuantizedWeight vec.
 fn build_ptr_table_from_qw(

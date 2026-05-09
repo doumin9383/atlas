@@ -17,10 +17,15 @@ struct RouterStatsConfig {
     enabled: bool,
     path: String,
     max_tokens_per_call: usize,
+    candidate_enabled: bool,
+    candidate_path: String,
+    candidate_top_n: usize,
+    candidate_mode: String,
 }
 
 static CONFIG: OnceLock<RouterStatsConfig> = OnceLock::new();
 static FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+static CANDIDATE_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
 fn config() -> &'static RouterStatsConfig {
     CONFIG.get_or_init(|| {
@@ -34,10 +39,23 @@ fn config() -> &'static RouterStatsConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(4)
             .max(1);
+        let candidate_top_n = std::env::var("ATLAS_MOE_CANDIDATE_TOP_N")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let candidate_path = std::env::var("ATLAS_MOE_CANDIDATE_LOG_PATH")
+            .unwrap_or_else(|_| "/tmp/atlas-moe-candidates.jsonl".to_string());
+        let candidate_mode =
+            std::env::var("ATLAS_MOE_CANDIDATE_LOG_MODE").unwrap_or_else(|_| "summary".to_string());
         RouterStatsConfig {
             enabled,
             path,
             max_tokens_per_call,
+            candidate_enabled: candidate_top_n > 0
+                && std::env::var("ATLAS_MOE_CANDIDATE_LOG_PATH").is_ok(),
+            candidate_path,
+            candidate_top_n,
+            candidate_mode,
         }
     })
 }
@@ -53,6 +71,20 @@ fn stats_file(path: &str) -> Option<&'static Mutex<File>> {
         },
     )
     .as_ref()
+}
+
+fn candidate_file(path: &str) -> Option<&'static Mutex<File>> {
+    CANDIDATE_FILE
+        .get_or_init(
+            || match OpenOptions::new().create(true).append(true).open(path) {
+                Ok(file) => Some(Mutex::new(file)),
+                Err(err) => {
+                    tracing::warn!("ATLAS_MOE_CANDIDATE_LOG: failed to open {path}: {err}");
+                    None
+                }
+            },
+        )
+        .as_ref()
 }
 
 fn entropy(weights: &[f32]) -> f32 {
@@ -82,12 +114,13 @@ impl MoeLayer {
         stream: u64,
     ) {
         let cfg = config();
-        if !cfg.enabled || ctx.graph_capture || top_k == 0 || num_tokens == 0 {
+        if (!cfg.enabled && !cfg.candidate_enabled)
+            || ctx.graph_capture
+            || top_k == 0
+            || num_tokens == 0
+        {
             return;
         }
-        let Some(file) = stats_file(&cfg.path) else {
-            return;
-        };
 
         if let Err(err) = ctx.gpu.synchronize(stream) {
             tracing::warn!("ATLAS_MOE_ROUTER_STATS: stream sync failed: {err:#}");
@@ -111,7 +144,16 @@ impl MoeLayer {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut out = file.lock();
+        let mut stats_out = if cfg.enabled {
+            stats_file(&cfg.path).map(|file| file.lock())
+        } else {
+            None
+        };
+        let mut candidate_out = if cfg.candidate_enabled {
+            candidate_file(&cfg.candidate_path).map(|file| file.lock())
+        } else {
+            None
+        };
         for token_index in 0..token_count {
             let offset = token_index * top_k_usize;
             let ids: Vec<u32> = (0..top_k_usize)
@@ -144,9 +186,36 @@ impl MoeLayer {
                 "max_prob": max_prob,
                 "margin_top1_top2": max_prob - second,
             });
-            if let Err(err) = writeln!(out, "{row}") {
-                tracing::warn!("ATLAS_MOE_ROUTER_STATS: write failed: {err}");
-                return;
+            if let Some(out) = stats_out.as_mut() {
+                if let Err(err) = writeln!(out, "{row}") {
+                    tracing::warn!("ATLAS_MOE_ROUTER_STATS: write failed: {err}");
+                    return;
+                }
+            }
+            if let Some(out) = candidate_out.as_mut() {
+                let observed_top_n = cfg.candidate_top_n.min(top_k_usize);
+                let candidate_row = json!({
+                    "request_id": null,
+                    "layer": self.layer_idx,
+                    "token_index": token_index,
+                    "top_n": cfg.candidate_top_n,
+                    "observed_top_n": observed_top_n,
+                    "candidate_log_mode": cfg.candidate_mode,
+                    "expert_ids": ids.iter().take(observed_top_n).copied().collect::<Vec<_>>(),
+                    "router_scores": scores.iter().take(observed_top_n).copied().collect::<Vec<_>>(),
+                    "router_probs": scores.iter().take(observed_top_n).copied().collect::<Vec<_>>(),
+                    "entropy": entropy(&scores),
+                    "top1_top2_margin": max_prob - second,
+                    "tail_mass_after_k": {
+                        "3": if top_k_usize > 3 { scores.iter().skip(3).sum::<f32>() } else { 0.0 },
+                        "6": if top_k_usize > 6 { scores.iter().skip(6).sum::<f32>() } else { 0.0 },
+                        "10": if top_k_usize > 10 { scores.iter().skip(10).sum::<f32>() } else { 0.0 },
+                    },
+                });
+                if let Err(err) = writeln!(out, "{candidate_row}") {
+                    tracing::warn!("ATLAS_MOE_CANDIDATE_LOG: write failed: {err}");
+                    return;
+                }
             }
         }
     }
