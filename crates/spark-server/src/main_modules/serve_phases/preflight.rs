@@ -52,6 +52,23 @@ pub(crate) fn preflight_reserve(
     } else {
         args.max_seq_len
     };
+    // Mirror of the auto-clamp in resolve_prefill_budget (kv_cache.rs).
+    // See issue #15: when prefix caching + SSM snapshots are both on,
+    // single-chunk prefill produces no reachable intermediate snapshots.
+    let prefill_budget_pre = if !user_set_prefill_pre
+        && args.enable_prefix_caching
+        && args.ssm_checkpoint_interval > 0
+        && args.ssm_cache_slots > 0
+    {
+        let target = args.ssm_checkpoint_interval * args.block_size;
+        if prefill_budget_pre > target && target > 0 {
+            target
+        } else {
+            prefill_budget_pre
+        }
+    } else {
+        prefill_budget_pre
+    };
     let max_batch_tokens_pre = prefill_budget_pre
         .max(spec_tokens_pre)
         .max(args.max_batch_size);
@@ -141,6 +158,15 @@ pub(crate) fn preflight_reserve(
     })
 }
 
+/// Initialize the GPU backend for the active feature.
+///
+/// Compile-time dispatch:
+/// - `cuda` feature → `AtlasCudaBackend` loading PTX modules from `ptx_set`.
+/// - `metal` feature → `MetalGpuBackend` loading metallib modules from
+///   `atlas_kernels::metallib_modules()`. The `ptx_set` argument is
+///   accepted (for ABI symmetry with the cuda variant) but ignored;
+///   metal kernels live in a parallel registry.
+#[cfg(feature = "cuda")]
 pub(crate) fn init_gpu_backend(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
@@ -153,6 +179,27 @@ pub(crate) fn init_gpu_backend(
     let free_mem = gpu.free_memory()?;
     tracing::info!(
         "GPU {}: {:.1} GB total, {:.1} GB free",
+        args.gpu_ordinal,
+        total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+        free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    Ok((gpu, free_mem))
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(crate) fn init_gpu_backend(
+    args: &cli::ServeArgs,
+    _ptx_set: &atlas_kernels::TargetPtxSet,
+) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
+    let modules = atlas_kernels::metallib_modules();
+    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(
+        spark_runtime::metal_backend::MetalGpuBackend::new(args.gpu_ordinal, &modules)
+            .context("Failed to initialize Metal backend")?,
+    );
+    let total_mem = gpu.total_memory()?;
+    let free_mem = gpu.free_memory()?;
+    tracing::info!(
+        "Metal device {}: {:.1} GB total, {:.1} GB free",
         args.gpu_ordinal,
         total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
         free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
