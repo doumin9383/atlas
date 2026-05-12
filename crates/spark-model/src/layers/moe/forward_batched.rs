@@ -19,7 +19,7 @@ impl MoeLayer {
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
-        let top_k = ctx.config.num_experts_per_tok as u32;
+        let route_top_k = ctx.config.num_experts_per_tok as u32;
         let bf16 = 2usize;
         let n = num_tokens as u32;
 
@@ -68,7 +68,7 @@ impl MoeLayer {
 
             let scratch = ctx.buffers.scratch();
             let indices_dev = scratch;
-            let weights_dev = scratch.offset(top_k as usize * 4);
+            let weights_dev = scratch.offset(route_top_k as usize * 4);
 
             if let Some(bias) = self.correction_bias_dev {
                 ops::moe_topk_sigmoid(
@@ -79,7 +79,7 @@ impl MoeLayer {
                     indices_dev,
                     weights_dev,
                     num_experts,
-                    top_k,
+                    route_top_k,
                     ctx.config.norm_topk_prob,
                     1.0,
                     stream,
@@ -92,11 +92,23 @@ impl MoeLayer {
                     indices_dev,
                     weights_dev,
                     num_experts,
-                    top_k,
+                    route_top_k,
                     ctx.config.norm_topk_prob,
                     stream,
                 )?;
             }
+            self.maybe_log_router_stats(indices_dev, weights_dev, 1, route_top_k, ctx, stream);
+            let active_k = self.local_frontier_active_k(route_top_k);
+            let weights_dev = self.maybe_compact_local_frontier_routes(
+                indices_dev,
+                weights_dev,
+                1,
+                route_top_k,
+                active_k,
+                ctx,
+                stream,
+            )?;
+            let top_k = active_k;
 
             let shared_out = ctx.buffers.attn_output();
             if let (Some(gp), Some(up), Some(dp), Some(sh)) = (

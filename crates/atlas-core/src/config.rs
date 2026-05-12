@@ -255,6 +255,11 @@ pub struct ModelConfig {
     pub ep_rank: usize,
     #[serde(skip)]
     pub ep_world_size: usize,
+    /// Optional v1 Local Frontier resident expert set. When present, routed
+    /// expert tensors outside this set are treated as non-resident for loading
+    /// and dispatch eligibility. This is a runtime policy, not a model field.
+    #[serde(default, skip_deserializing, skip_serializing)]
+    pub resident_expert_set: Option<std::collections::BTreeSet<usize>>,
 
     // ── Tensor Parallelism (set at runtime, not from config.json) ──
     /// TP rank within the TP sub-communicator. 0 if `tp_world_size==1`.

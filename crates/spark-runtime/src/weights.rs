@@ -4,7 +4,7 @@
 
 use crate::gpu::{DevicePtr, GpuBackend};
 use anyhow::{Result, bail};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 /// Advise the OS to evict a file's pages from the page cache.
@@ -154,6 +154,9 @@ pub struct SafetensorsLoader {
     pub ep_world_size: usize,
     /// Total number of MoE experts in the model (for EP partitioning).
     pub num_experts: usize,
+    /// Optional Local Frontier resident expert set. Expert tensors outside the
+    /// set are skipped at load time; non-expert tensors remain replicated.
+    pub resident_expert_set: Option<BTreeSet<usize>>,
     /// Override for the peak memory multiplier in the pre-flight OOM check.
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
@@ -173,6 +176,7 @@ impl SafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            resident_expert_set: resident_expert_set_from_env(),
             peak_memory_multiplier: None,
         }
     }
@@ -183,6 +187,7 @@ impl SafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            resident_expert_set: resident_expert_set_from_env(),
             peak_memory_multiplier: None,
         }
     }
@@ -191,25 +196,68 @@ impl SafetensorsLoader {
     /// Skips `*.experts.{E}.*` tensors where E is not in local range.
     /// MTP head experts are never skipped (small, fully replicated).
     fn should_skip_tensor(&self, name: &str) -> bool {
-        if self.ep_world_size <= 1 {
-            return false;
-        }
         // MTP head experts are small — always replicate, never shard.
         if name.starts_with("mtp.") {
             return false;
         }
         // Parse expert index from patterns like "*.experts.42.gate_proj*"
         if let Some(idx) = parse_expert_index(name) {
-            let per_rank = self.num_experts / self.ep_world_size;
-            let local_start = self.ep_rank * per_rank;
-            let local_end = if self.ep_rank == self.ep_world_size - 1 {
-                self.num_experts
-            } else {
-                local_start + per_rank
-            };
-            idx < local_start || idx >= local_end
+            if self.ep_world_size > 1 {
+                let per_rank = self.num_experts / self.ep_world_size;
+                let local_start = self.ep_rank * per_rank;
+                let local_end = if self.ep_rank == self.ep_world_size - 1 {
+                    self.num_experts
+                } else {
+                    local_start + per_rank
+                };
+                if idx < local_start || idx >= local_end {
+                    return true;
+                }
+            }
+            self.resident_expert_set
+                .as_ref()
+                .map(|resident| !resident.contains(&idx))
+                .unwrap_or(false)
         } else {
             false // Non-expert tensors are always loaded (replicated)
+        }
+    }
+}
+
+pub fn parse_expert_id_set(raw: &str) -> Result<BTreeSet<usize>> {
+    let mut out = BTreeSet::new();
+    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some((start, end)) = item.split_once('-') {
+            let start = start
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| anyhow::anyhow!("invalid expert range start '{start}': {e}"))?;
+            let end = end
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| anyhow::anyhow!("invalid expert range end '{end}': {e}"))?;
+            if start > end {
+                bail!("invalid expert range '{item}': start is greater than end");
+            }
+            out.extend(start..=end);
+        } else {
+            out.insert(
+                item.parse::<usize>()
+                    .map_err(|e| anyhow::anyhow!("invalid expert id '{item}': {e}"))?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn resident_expert_set_from_env() -> Option<BTreeSet<usize>> {
+    let raw = std::env::var("ATLAS_MOE_RESIDENT_EXPERTS").ok()?;
+    match parse_expert_id_set(raw.trim()) {
+        Ok(set) if !set.is_empty() => Some(set),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!("ATLAS_MOE_RESIDENT_EXPERTS ignored: {err:#}");
+            None
         }
     }
 }

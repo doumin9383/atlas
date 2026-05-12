@@ -57,6 +57,7 @@ pub(crate) fn apply_moe_top_k_override(
     args: &cli::ServeArgs,
     config: &mut ModelConfig,
 ) -> Result<()> {
+    let model_default_top_k = config.num_experts_per_tok;
     let env_override = match std::env::var("ATLAS_MOE_TOP_K_OVERRIDE") {
         Ok(raw) if !raw.trim().is_empty() => Some(
             raw.trim()
@@ -81,6 +82,7 @@ pub(crate) fn apply_moe_top_k_override(
                 args.moe_top_k_policy,
             );
         }
+        log_moe_top_k_startup(model_default_top_k, None, config);
         return Ok(());
     };
 
@@ -102,17 +104,88 @@ pub(crate) fn apply_moe_top_k_override(
         );
     }
 
-    let default_top_k = config.num_experts_per_tok;
     config.num_experts_per_tok = override_top_k;
     tracing::info!(
         "MoE top-k policy: fixed override active (source={}, default_top_k={}, override_top_k={}, num_experts={}, norm_topk_prob={})",
         if env_forced { "env" } else { "cli" },
-        default_top_k,
+        model_default_top_k,
         override_top_k,
         config.num_experts,
         config.norm_topk_prob,
     );
+    log_moe_top_k_startup(model_default_top_k, Some(override_top_k), config);
     Ok(())
+}
+
+pub(crate) fn apply_local_frontier_resident_set(config: &mut ModelConfig) -> Result<()> {
+    let raw = match std::env::var("ATLAS_MOE_RESIDENT_EXPERTS") {
+        Ok(raw) if !raw.trim().is_empty() => raw,
+        _ => {
+            tracing::info!(
+                "Local Frontier resident set: disabled (all {} experts resident)",
+                config.num_experts
+            );
+            return Ok(());
+        }
+    };
+    let resident = spark_runtime::weights::parse_expert_id_set(raw.trim())
+        .with_context(|| "Invalid ATLAS_MOE_RESIDENT_EXPERTS")?;
+    if resident.is_empty() {
+        anyhow::bail!("ATLAS_MOE_RESIDENT_EXPERTS resolved to an empty resident set");
+    }
+    if let Some(max_id) = resident.iter().next_back()
+        && *max_id >= config.num_experts
+    {
+        anyhow::bail!(
+            "ATLAS_MOE_RESIDENT_EXPERTS contains expert {}, but model has experts 0..{}",
+            max_id,
+            config.num_experts.saturating_sub(1)
+        );
+    }
+
+    let preview = resident
+        .iter()
+        .take(16)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    config.resident_expert_set = Some(resident);
+    tracing::info!(
+        "Local Frontier resident set: resident_experts={}, total_experts={}, resident_set_version={:?}, first_experts=[{}]",
+        config
+            .resident_expert_set
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(0),
+        config.num_experts,
+        std::env::var("ATLAS_MOE_RESIDENT_SET_VERSION").ok(),
+        preview,
+    );
+    Ok(())
+}
+
+fn log_moe_top_k_startup(
+    model_default_top_k: usize,
+    override_top_k: Option<usize>,
+    config: &ModelConfig,
+) {
+    let candidate_top_n = std::env::var("ATLAS_MOE_CANDIDATE_TOP_N").ok();
+    let weighted_rerank_enabled = std::env::var("ATLAS_MOE_WEIGHTED_RERANK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    tracing::info!(
+        "MoE startup top-k: model_default_top_k={}, ATLAS_MOE_TOP_K_OVERRIDE={:?}, effective_top_k={}, max_supported_top_k={}, scratch_buffer_top_k_capacity={}, candidate_top_n={:?}, weighted_rerank_enabled={}",
+        model_default_top_k,
+        std::env::var("ATLAS_MOE_TOP_K_OVERRIDE").ok(),
+        config.num_experts_per_tok,
+        config.num_experts,
+        config.num_experts_per_tok,
+        candidate_top_n,
+        weighted_rerank_enabled,
+    );
+    if let Some(k) = override_top_k {
+        tracing::info!("MoE startup effective_top_k={k}");
+    }
 }
 
 pub(crate) fn resolve_model_dir(args: &cli::ServeArgs) -> Result<std::path::PathBuf> {

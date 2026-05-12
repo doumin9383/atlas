@@ -262,6 +262,7 @@ mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod init;
+mod local_frontier;
 mod router_stats;
 mod weighted_rerank;
 

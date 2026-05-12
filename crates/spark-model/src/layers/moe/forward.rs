@@ -57,7 +57,7 @@ impl MoeLayer {
         let inter = ctx.config.moe_intermediate_size as u32;
         let _shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
-        let top_k = ctx.config.num_experts_per_tok as u32;
+        let route_top_k = ctx.config.num_experts_per_tok as u32;
         let profile = ctx.profile;
 
         macro_rules! prof {
@@ -76,7 +76,7 @@ impl MoeLayer {
 
         let scratch = ctx.buffers.scratch();
         let indices_dev = scratch;
-        let weights_dev = scratch.offset(top_k as usize * 4);
+        let weights_dev = scratch.offset(route_top_k as usize * 4);
 
         // Note: moe_gate_topk_fused exists but uses single-CTA design,
         // too slow for 256 experts (serializes computation). Separate path is faster.
@@ -127,7 +127,7 @@ impl MoeLayer {
                         indices_dev,
                         weights_dev,
                         num_experts,
-                        top_k,
+                        route_top_k,
                         ctx.config.norm_topk_prob,
                         1.0,
                         stream,
@@ -140,14 +140,25 @@ impl MoeLayer {
                         indices_dev,
                         weights_dev,
                         num_experts,
-                        top_k,
+                        route_top_k,
                         ctx.config.norm_topk_prob,
                         stream,
                     )
                 }
             })?;
         }
-        self.maybe_log_router_stats(indices_dev, weights_dev, 1, top_k, ctx, stream);
+        let active_k = self.local_frontier_active_k(route_top_k);
+        self.maybe_log_router_stats(indices_dev, weights_dev, 1, route_top_k, ctx, stream);
+        let weights_dev = self.maybe_compact_local_frontier_routes(
+            indices_dev,
+            weights_dev,
+            1,
+            route_top_k,
+            active_k,
+            ctx,
+            stream,
+        )?;
+        let top_k = active_k;
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             ctx.gpu.synchronize(stream)?;

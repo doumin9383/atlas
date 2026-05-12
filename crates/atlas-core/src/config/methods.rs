@@ -121,7 +121,13 @@ impl ModelConfig {
     /// Whether the given expert ID is local to this EP rank.
     pub fn is_local_expert(&self, expert_id: usize) -> bool {
         let (start, end) = self.local_expert_range();
-        expert_id >= start && expert_id < end
+        if expert_id < start || expert_id >= end {
+            return false;
+        }
+        self.resident_expert_set
+            .as_ref()
+            .map(|resident| resident.contains(&expert_id))
+            .unwrap_or(true)
     }
 
     /// Range `[start, end)` of a `total`-sized dimension owned by this TP rank.

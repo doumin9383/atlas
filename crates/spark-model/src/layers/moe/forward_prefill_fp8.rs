@@ -27,9 +27,10 @@ impl MoeLayer {
         let inter = ctx.config.moe_intermediate_size as u32;
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
-        let top_k = ctx.config.num_experts_per_tok as u32;
+        let route_top_k = ctx.config.num_experts_per_tok as u32;
         let n = num_tokens as u32;
-        let total_expanded = n * top_k;
+        let mut top_k = route_top_k;
+        let mut total_expanded = n * top_k;
         let ne = num_experts as usize;
 
         let (gp, up, dp, sh) = match (
@@ -143,7 +144,7 @@ impl MoeLayer {
                 indices_dev,
                 weights_dev,
                 num_experts,
-                top_k,
+                route_top_k,
                 ctx.config.norm_topk_prob,
                 1.0,
                 n,
@@ -157,12 +158,26 @@ impl MoeLayer {
                 indices_dev,
                 weights_dev,
                 num_experts,
-                top_k,
+                route_top_k,
                 ctx.config.norm_topk_prob,
                 n,
                 stream,
             )?;
         }
+
+        self.maybe_log_router_stats(indices_dev, weights_dev, n, route_top_k, ctx, stream);
+        let active_k = self.local_frontier_active_k(route_top_k);
+        let weights_dev = self.maybe_compact_local_frontier_routes(
+            indices_dev,
+            weights_dev,
+            n,
+            route_top_k,
+            active_k,
+            ctx,
+            stream,
+        )?;
+        top_k = active_k;
+        total_expanded = n * top_k;
 
         // 3. Sort tokens by expert
         let te = total_expanded as usize;

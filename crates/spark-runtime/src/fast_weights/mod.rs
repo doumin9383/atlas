@@ -22,7 +22,7 @@ use crate::weights::{
     estimate_load_bytes, evict_page_cache, parse_expert_index,
 };
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
@@ -38,6 +38,7 @@ pub struct FastSafetensorsLoader {
     pub ep_rank: usize,
     pub ep_world_size: usize,
     pub num_experts: usize,
+    pub resident_expert_set: Option<BTreeSet<usize>>,
     pub peak_memory_multiplier: Option<f64>,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
@@ -71,6 +72,11 @@ impl FastSafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            resident_expert_set: crate::weights::parse_expert_id_set(
+                &std::env::var("ATLAS_MOE_RESIDENT_EXPERTS").unwrap_or_default(),
+            )
+            .ok()
+            .filter(|set| !set.is_empty()),
             peak_memory_multiplier: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
@@ -82,6 +88,11 @@ impl FastSafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            resident_expert_set: crate::weights::parse_expert_id_set(
+                &std::env::var("ATLAS_MOE_RESIDENT_EXPERTS").unwrap_or_default(),
+            )
+            .ok()
+            .filter(|set| !set.is_empty()),
             peak_memory_multiplier: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
@@ -89,21 +100,26 @@ impl FastSafetensorsLoader {
     }
 
     fn should_skip_tensor(&self, name: &str) -> bool {
-        if self.ep_world_size <= 1 {
-            return false;
-        }
         if name.starts_with("mtp.") {
             return false;
         }
         if let Some(idx) = parse_expert_index(name) {
-            let per_rank = self.num_experts / self.ep_world_size;
-            let local_start = self.ep_rank * per_rank;
-            let local_end = if self.ep_rank == self.ep_world_size - 1 {
-                self.num_experts
-            } else {
-                local_start + per_rank
-            };
-            idx < local_start || idx >= local_end
+            if self.ep_world_size > 1 {
+                let per_rank = self.num_experts / self.ep_world_size;
+                let local_start = self.ep_rank * per_rank;
+                let local_end = if self.ep_rank == self.ep_world_size - 1 {
+                    self.num_experts
+                } else {
+                    local_start + per_rank
+                };
+                if idx < local_start || idx >= local_end {
+                    return true;
+                }
+            }
+            self.resident_expert_set
+                .as_ref()
+                .map(|resident| !resident.contains(&idx))
+                .unwrap_or(false)
         } else {
             false
         }

@@ -45,6 +45,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // whose TOP LEVEL is already the quantization block.
     serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
     serve_phases::apply_moe_top_k_override(&args, &mut config)?;
+    serve_phases::apply_local_frontier_resident_set(&mut config)?;
 
     if let Some(ref qc) = config.quantization_config {
         tracing::info!(
