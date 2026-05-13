@@ -403,6 +403,7 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: false,
+            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
 
         // ── 4. Per-layer forward: SSM uses three-phase, attention uses standard ──

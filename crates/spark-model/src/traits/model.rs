@@ -501,6 +501,13 @@ pub trait Model: Send + Sync {
         0
     }
 
+    /// Set the per-request MoE expert top-k override.
+    ///
+    /// Called by the scheduler before each forward pass. The model uses this
+    /// in MoE forward paths instead of `config.num_experts_per_tok`. Default
+    /// no-op for models without MoE layers.
+    fn set_moe_top_k(&self, _k: u32) {}
+
     /// Return the default CUDA stream handle.
     fn default_stream(&self) -> u64 {
         0

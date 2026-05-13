@@ -115,6 +115,9 @@ pub enum InferenceRequest {
         top_logprobs: Option<u8>,
         /// Request timeout as absolute deadline. None = no timeout.
         timeout_at: Option<std::time::Instant>,
+        /// MoE expert top-k override. None = use model config default (num_experts_per_tok).
+        /// Must be ≤ num_experts_per_tok (buffer capacity at startup).
+        moe_top_k: Option<u32>,
         response_tx: tokio::sync::oneshot::Sender<anyhow::Result<InferenceResponse>>,
     },
     /// Streaming: sends tokens as they're generated.
@@ -181,6 +184,9 @@ pub enum InferenceRequest {
         top_logprobs: Option<u8>,
         /// Request timeout as absolute deadline. None = no timeout.
         timeout_at: Option<std::time::Instant>,
+        /// MoE expert top-k override. None = use model config default (num_experts_per_tok).
+        /// Must be ≤ num_experts_per_tok (buffer capacity at startup).
+        moe_top_k: Option<u32>,
         token_tx: tokio::sync::mpsc::Sender<StreamEvent>,
     },
 }

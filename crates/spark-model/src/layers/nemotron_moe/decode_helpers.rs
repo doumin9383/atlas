@@ -28,7 +28,7 @@ impl NemotronMoeLayer {
         let inter = ctx.config.moe_intermediate_size as u32;
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
-        let top_k = ctx.config.num_experts_per_tok as u32;
+        let top_k = ctx.moe_top_k;
         let eps = ctx.config.rms_norm_eps as f32;
         let scale = ctx.config.routed_scaling_factor as f32;
 

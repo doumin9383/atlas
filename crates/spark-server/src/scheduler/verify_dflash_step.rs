@@ -27,6 +27,9 @@ use super::*;
 ///   * Sliding-window state rollback for sliding-attention layers
 ///     (Gemma-4-style; not used by Qwen3.6 targets).
 pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_drafts: usize) {
+    if let Some(k) = a.moe_top_k {
+        model.set_moe_top_k(k);
+    }
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         a.finished = true;

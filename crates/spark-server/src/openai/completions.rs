@@ -45,6 +45,10 @@ pub struct CompletionRequest {
     pub stop: Vec<String>,
     /// Seed for deterministic sampling (same as chat completions).
     pub seed: Option<u64>,
+    /// MoE expert top-k override. Separate from sampling top_k. None = use
+    /// model config default. Must be ≤ num_experts_per_tok.
+    #[serde(default)]
+    pub moe_top_k: Option<u32>,
 }
 
 /// Accept `prompt` as a string or array of strings (joined).

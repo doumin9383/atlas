@@ -272,8 +272,11 @@ impl TransformerModel {
                 profile: false,
                 comm: ctx.comm,
                 graph_capture: ctx.graph_capture,
+                moe_top_k: ctx.moe_top_k,
             }
+
         };
+
 
         // Diagnostic: dump hidden state for first 2 decode tokens after prefill
         let diag = seq.seq_len < seq.tokens.len() + 2;
@@ -453,6 +456,7 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: false, // Eager mode — no CUDA graph
+            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only

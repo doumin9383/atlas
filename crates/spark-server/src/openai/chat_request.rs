@@ -175,6 +175,12 @@ pub struct ChatCompletionRequest {
     /// model's reasoning parser supports it.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// MoE expert top-k override. Controls how many experts are activated
+    /// per token in MoE layers. Separate from sampling top_k. None = use
+    /// model config default (num_experts_per_tok). Must be ≤
+    /// num_experts_per_tok (buffer capacity at startup).
+    #[serde(default)]
+    pub moe_top_k: Option<u32>,
 }
 
 /// Stream options (OpenAI-compatible).

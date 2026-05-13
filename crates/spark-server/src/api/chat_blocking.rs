@@ -53,6 +53,7 @@ pub(super) struct BlockingPathArgs {
     pub grammar_spec: Option<GrammarSpec>,
     pub top_logprobs: Option<u8>,
     pub timeout_at: Option<std::time::Instant>,
+    pub moe_top_k: Option<u32>,
     pub cwd_hint: Option<String>,
     pub prompt_len: usize,
 }
@@ -89,6 +90,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
         grammar_spec,
         top_logprobs,
         timeout_at,
+        moe_top_k,
         cwd_hint,
         prompt_len,
     } = args;
@@ -136,6 +138,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
             seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
             top_logprobs,
             timeout_at,
+            moe_top_k,
             response_tx: tx,
         };
 

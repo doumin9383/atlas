@@ -392,6 +392,7 @@ impl TransformerModel {
         // value is dead code and must not suppress CUDA graphs.
         let has_fp8_calibration = config.fp8_kv_calibration_tokens > 0
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
+        let moe_top_k_init = config.num_experts_per_tok as u32;
         Ok(Self {
             config,
             embed_tokens,
@@ -465,6 +466,7 @@ impl TransformerModel {
             use_fp32_logits,
             logits_fp32_buf,
             embed_scale_kernel,
+            moe_top_k: std::sync::atomic::AtomicU32::new(moe_top_k_init),
         })
     }
 }

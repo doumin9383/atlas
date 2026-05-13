@@ -7,6 +7,10 @@ use super::*;
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
 pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) {
+    let moe_k = active.iter().filter_map(|a| a.moe_top_k).min().unwrap_or(0);
+    if moe_k > 0 {
+        model.set_moe_top_k(moe_k);
+    }
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {

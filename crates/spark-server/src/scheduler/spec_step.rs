@@ -7,6 +7,10 @@ use super::*;
 /// Self-speculative step: draft via layer-skipping, verify with full model.
 /// Combines bootstrap + verify in one step (no pipeline).
 pub fn step_self_spec(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) {
+    let moe_k = active.iter().filter_map(|a| a.moe_top_k).min().unwrap_or(0);
+    if moe_k > 0 {
+        model.set_moe_top_k(moe_k);
+    }
     let a = &mut active[0];
 
     // 1. Full-model decode to get token_0
@@ -151,6 +155,10 @@ pub fn step_self_spec(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: u
 /// 1. Bootstrap: regular decode → argmax → N-gram propose → pending_drafts
 /// 2. Verify: decode_verify_graphed(K=2) → accept/reject → SSM rollback
 pub fn step_ngram(model: &dyn Model, active: &mut [ActiveSeq], proposer: &mut NgramProposer) {
+    let moe_k = active.iter().filter_map(|a| a.moe_top_k).min().unwrap_or(0);
+    if moe_k > 0 {
+        model.set_moe_top_k(moe_k);
+    }
     let a = &mut active[0];
 
     if !a.pending_drafts.is_empty() {
@@ -210,6 +218,9 @@ pub fn step_ngram_verify(
     drafts: &[u32],
     proposer: &mut NgramProposer,
 ) {
+    if let Some(k) = a.moe_top_k {
+        model.set_moe_top_k(k);
+    }
     let t_sync = Instant::now();
     if let Err(e) = model.sync_secondary() {
         tracing::error!("ngram sync_secondary: {e:#}");

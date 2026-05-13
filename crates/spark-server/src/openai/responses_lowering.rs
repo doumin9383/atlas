@@ -226,6 +226,7 @@ pub fn lower_responses_to_chat(
         prediction: None,
         web_search_options: None,
         reasoning_effort: None,
+        moe_top_k: None,
     })
 }
 

@@ -157,6 +157,7 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
 
         // ── Phase 2: CUDA graph capture / replay ──

@@ -134,6 +134,7 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
 
         // Profile mode: use per-layer sync decode for timing breakdown.

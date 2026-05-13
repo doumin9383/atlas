@@ -19,7 +19,7 @@ impl MoeLayer {
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
-        let top_k = ctx.config.num_experts_per_tok as u32;
+        let top_k = ctx.moe_top_k;
 
         // Gemma-4 router pre-norm (no-op for other models).
         let router_in = self.router_input(input, 2, h, ctx, stream)?;

@@ -395,6 +395,7 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: false,
+            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
 
         let prefill_ctx = ForwardContext {
@@ -405,6 +406,7 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: false,
+            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {

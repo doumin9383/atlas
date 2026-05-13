@@ -28,6 +28,10 @@ pub struct MessagesRequest {
     pub stream: bool,
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
+    /// MoE expert top-k override. Separate from sampling top_k. None = use
+    /// model config default (num_experts_per_tok).
+    #[serde(default)]
+    pub moe_top_k: Option<u32>,
 }
 
 /// System content: either a plain string or an array of content blocks.

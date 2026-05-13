@@ -192,6 +192,9 @@ pub(crate) async fn chat_completions_inner(
         );
     }
 
+    // Resolve per-request MoE top-k (None = use model config default).
+    let moe_top_k = req.moe_top_k;
+
     // ── Phase 6: sampling preset / stop / grammar / timeout ─────
     let sampling_setup::SamplingSetup {
         temperature,
@@ -259,6 +262,7 @@ pub(crate) async fn chat_completions_inner(
             grammar_spec.clone(),
             top_logprobs,
             timeout_at,
+            moe_top_k,
         )
         .await;
     }
@@ -294,6 +298,7 @@ pub(crate) async fn chat_completions_inner(
         grammar_spec,
         top_logprobs,
         timeout_at,
+        moe_top_k,
         cwd_hint,
         prompt_len,
     })

@@ -7,6 +7,9 @@ use super::*;
 /// K=4 verify: [last_token, draft1, draft2, draft3] → [v0, v1, v2, v3].
 /// Four outcomes: accept 0, 1, 2, or 3 drafts.
 pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_drafts: usize) {
+    if let Some(k) = a.moe_top_k {
+        model.set_moe_top_k(k);
+    }
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         a.finished = true;

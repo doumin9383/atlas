@@ -205,6 +205,7 @@ impl TransformerModel {
                 // MTP runs on rank 0 only — no EP all_reduce (BUG #26).
                 comm: None,
                 graph_capture: false,
+                moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
             };
             let drafts = proposer.propose(
                 token_0,

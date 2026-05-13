@@ -150,6 +150,11 @@ pub struct ForwardContext<'a> {
     /// True when inside CUDA graph capture (between begin_capture/end_capture).
     /// MoE layers use sync all_reduce (capturable) instead of async (event-based).
     pub graph_capture: bool,
+    /// Per-request MoE expert top-k override. When set, MoE dispatch uses
+    /// this value instead of `config.num_experts_per_tok`. Must be ≤
+    /// `config.num_experts_per_tok` (buffer capacity). Set by the scheduler
+    /// before each forward pass.
+    pub moe_top_k: u32,
 }
 
 /// A single transformer layer performing the full per-layer computation.

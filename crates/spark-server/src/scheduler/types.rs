@@ -71,6 +71,8 @@ pub(super) struct PrefillInProgress {
     pub seed: Option<u64>,
     pub top_logprobs: Option<u8>,
     pub timeout_at: Option<Instant>,
+    /// MoE expert top-k override (None = use model config default).
+    pub moe_top_k: Option<u32>,
 }
 
 /// An in-flight sequence participating in batched decode.
@@ -174,6 +176,8 @@ pub(super) struct ActiveSeq {
     pub logprobs_data: Vec<crate::api::TokenLogprobs>,
     /// Request timeout deadline. None = no timeout.
     pub timeout_at: Option<Instant>,
+    /// MoE expert top-k override (None = use model config default).
+    pub moe_top_k: Option<u32>,
     /// Adaptive sampling state.
     pub adaptive: crate::adaptive_sampler::AdaptiveSamplingState,
     /// Number of prompt tokens served by the prefix cache (no prefill cost).
@@ -243,5 +247,7 @@ pub(super) struct SwappedSeq {
     /// Number of prompt tokens served by the prefix cache (no prefill cost).
     pub cached_prompt_tokens: u32,
     pub timeout_at: Option<Instant>,
+    /// MoE expert top-k override (None = use model config default).
+    pub moe_top_k: Option<u32>,
     pub swap_id: u64,
 }

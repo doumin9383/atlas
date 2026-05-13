@@ -143,3 +143,15 @@ it in the PR description so reviewers catch it.
 See `CONTRIBUTING.md` for coding style and the CLA expectations,
 `SECURITY.md` for disclosure, and `docs/design/` for the authoritative
 architecture references.
+
+## Project-local conventions (atlas-frontier)
+
+- **言語**: ユーザとは日本語で会話する。コードのコメントやcommit messageは英語のまま。
+- **コンパイル環境**: k3sクラスター内の `llm-gateway/atlas-build` Pod (ARM64, CUDA 13.0, Rust 1.95.0) で `cargo build --release -p spark-server` を実行する。このPodにGPU（`thinkstationpgx-19fa` node, `nvidia.com/gpu: 1`）がアタッチされている。GPU不要のチェック（clippy/fmt/test）は現在のPodで `ATLAS_SKIP_BUILD=1` を設定して実行する。
+  ```bash
+  # GPUビルド
+  kubectl exec -n llm-gateway atlas-build -- bash -c 'source /root/.cargo/env && export CUDA_HOME=/usr/local/cuda && export ATLAS_TARGET_HW=gb10 && export ATLAS_TARGET_MODEL="*" && export ATLAS_TARGET_QUANT="*" && cd /workspace/atlas && cargo build --release -p spark-server 2>&1'
+
+  # GPU不要チェック
+  ATLAS_SKIP_BUILD=1 cargo clippy --workspace --tests --all-features -- -Dwarnings
+  ```
