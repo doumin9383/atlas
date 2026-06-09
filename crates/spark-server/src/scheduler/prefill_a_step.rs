@@ -48,6 +48,7 @@ pub fn start_chunked_prefill(
     let req_session_hash = req.session_hash();
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
+    let req_repetition_detection = req.repetition_detection();
     if req_enable_thinking {
         tracing::info!("Thinking enabled, budget={:?}", req_thinking_budget);
     }
@@ -58,7 +59,7 @@ pub fn start_chunked_prefill(
     let req_top_logprobs = req.top_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec);
+    let mut grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
@@ -177,7 +178,17 @@ pub fn start_chunked_prefill(
 
     if is_last {
         // Single chunk covered the entire prompt — get first token.
-        let first = match sample_token(model, logits, temperature, top_k, top_p, eos_tokens) {
+        // #131: constrain the FIRST token with the grammar (and advance the
+        // matcher). Mirrors prefill_b_step; no-op when no grammar is active.
+        let first = match sample_first_token(
+            model,
+            logits,
+            temperature,
+            top_k,
+            top_p,
+            eos_tokens,
+            grammar_state.as_mut(),
+        ) {
             Ok(t) => {
                 tracing::info!("Prefill first token: {t}");
                 t
@@ -212,6 +223,9 @@ pub fn start_chunked_prefill(
         // When grammar is active, disable legacy require_tool_call (grammar handles EOS).
         let use_legacy_tool_call =
             req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
+        // F4: sticky tool-request flag — grammar attached OR legacy tool path.
+        // Computed before `grammar_state` is moved into the ActiveSeq below.
+        let tool_request = grammar_state.is_some() || use_legacy_tool_call;
 
         let now = Instant::now();
         let cached_prompt_tok = seq.cached_prefix_tokens as u32;
@@ -246,10 +260,12 @@ pub fn start_chunked_prefill(
                 inside_thinking: req_enable_thinking && think_end_token.is_some(),
                 enable_thinking: req_enable_thinking,
                 thinking_budget: req_thinking_budget,
+                repetition_detection: req_repetition_detection,
                 spontaneous_think_budget,
                 thinking_tokens: 0,
                 cached_prompt_tokens: cached_prompt_tok,
                 force_end_thinking: false,
+                sentence_defer_count: 0,
                 consecutive_confident: 0,
                 in_code_fence: false,
                 think_end_token,
@@ -258,9 +274,14 @@ pub fn start_chunked_prefill(
                 think_just_ended: false,
                 think_skip_count: 0,
                 require_tool_call: use_legacy_tool_call,
+                tool_request,
                 tool_call_start_token,
                 tool_call_opened: false,
                 inside_tool_body: false,
+                tool_call_completed: false,
+                tool_body_streak_tokens: 0,
+                inside_parameter_body: false,
+                param_body_chars_emitted: 0,
                 suppress_tool_call: req_suppress_tool_call,
                 disable_mtp: req_disable_mtp,
                 content_started: false,
@@ -322,10 +343,12 @@ pub fn start_chunked_prefill(
                 } else {
                     req_thinking_budget
                 },
+                repetition_detection: req_repetition_detection,
                 spontaneous_think_budget,
                 thinking_tokens: 0,
                 cached_prompt_tokens: cached_prompt_tok,
                 force_end_thinking: false,
+                sentence_defer_count: 0,
                 consecutive_confident: 0,
                 in_code_fence: false,
                 think_end_token,
@@ -338,9 +361,14 @@ pub fn start_chunked_prefill(
                 think_just_ended: false,
                 think_skip_count: 0,
                 require_tool_call: use_legacy_tool_call,
+                tool_request,
                 tool_call_start_token,
                 tool_call_opened: false,
                 inside_tool_body: false,
+                tool_call_completed: false,
+                tool_body_streak_tokens: 0,
+                inside_parameter_body: false,
+                param_body_chars_emitted: 0,
                 suppress_tool_call: req_suppress_tool_call,
                 disable_mtp: req_disable_mtp,
                 content_started: false,
@@ -393,6 +421,7 @@ pub fn start_chunked_prefill(
             logit_bias,
             enable_thinking: req_enable_thinking,
             thinking_budget: req_thinking_budget,
+            repetition_detection: req_repetition_detection,
             spontaneous_think_budget,
             require_tool_call: req_require_tool_call,
             suppress_tool_call: req_suppress_tool_call,

@@ -31,7 +31,7 @@ use std::time::Instant;
 use spark_model::traits::Model;
 
 use super::phase_promote_prefills::promote_completed_prefills;
-use super::sample_token;
+use super::sample_first_token;
 use super::types::{ActiveSeq, PrefillInProgress};
 use crate::scheduling_policy::{ActiveSeqTiming, SchedulingPolicy};
 
@@ -56,7 +56,6 @@ pub(super) fn continue_in_progress_prefills(
     code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
-    reflection_suppress_ids: &[u32],
     adaptive_sampling: bool,
 ) -> bool {
     let mut did_mixed_step = false;
@@ -148,7 +147,6 @@ pub(super) fn continue_in_progress_prefills(
             code_fence_token,
             tool_call_start_token,
             tool_call_end_token,
-            reflection_suppress_ids,
             adaptive_sampling,
             &mut did_mixed_step,
         );
@@ -191,13 +189,16 @@ pub(super) fn continue_in_progress_prefills(
                     p.chunk_offset = p.prompt_tokens.len();
                     let _ = model.record_event(prefill_event, prefill_stream);
                     let _ = model.stream_wait_event(model.default_stream(), prefill_event);
-                    match sample_token(
+                    // #131: grammar-constrain the FIRST token (and advance the
+                    // matcher); no-op without a grammar.
+                    match sample_first_token(
                         model,
                         logits,
                         p.temperature,
                         p.top_k,
                         p.top_p,
                         &p.eos_tokens,
+                        p.grammar_state.as_mut(),
                     ) {
                         Ok(first) => {
                             tracing::info!("Two-phase prefill first token: {first}");
@@ -234,7 +235,6 @@ pub(super) fn continue_in_progress_prefills(
                 code_fence_token,
                 tool_call_start_token,
                 tool_call_end_token,
-                reflection_suppress_ids,
                 adaptive_sampling,
                 &mut completed_indices,
                 &mut did_mixed_step,

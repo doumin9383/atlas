@@ -51,11 +51,9 @@ impl Qwen3SsmLayer {
         // element size: BF16 on GB10 (HARDWARE.toml ATLAS_HW_FP32_RESIDUAL=
         // false), FP32 otherwise. A hardcoded `* 4` would over-stride into
         // the wrong batch slot for i>=1 on BF16 hidden.
-        let residual_elem = if ctx.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
+        // FP32-residual was removed (#227): the residual stream is always
+        // BF16 (2 bytes) on this codebase, so hardcode the per-seq stride.
+        let residual_elem = 2usize;
 
         // ── Phase A: per-sequence SSM mixer ──
         // Pre-norm, SSM mixer (recurrent, per-seq state), post-attn-norm.

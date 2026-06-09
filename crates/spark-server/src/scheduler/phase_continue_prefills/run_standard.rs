@@ -11,7 +11,7 @@ use spark_model::traits::{Model, SequenceState};
 use std::time::Instant;
 
 use super::super::decode_logits_step::process_decode_logits;
-use super::super::sample_token;
+use super::super::sample_first_token;
 use super::super::types::{ActiveSeq, PrefillInProgress};
 
 #[allow(clippy::too_many_arguments)]
@@ -31,7 +31,6 @@ pub(super) fn run_standard_chunk_loop(
     code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
-    reflection_suppress_ids: &[u32],
     adaptive_sampling: bool,
     completed_indices: &mut Vec<(usize, Option<u32>)>,
     did_mixed_step: &mut bool,
@@ -107,13 +106,16 @@ pub(super) fn run_standard_chunk_loop(
                     }
                     let _ = model.record_event(prefill_event, prefill_stream);
                     let _ = model.stream_wait_event(model.default_stream(), prefill_event);
-                    match sample_token(
+                    // #131: grammar-constrain the FIRST token (and advance the
+                    // matcher); no-op without a grammar.
+                    match sample_first_token(
                         model,
                         result.prefill_logits,
                         p.temperature,
                         p.top_k,
                         p.top_p,
                         &p.eos_tokens,
+                        p.grammar_state.as_mut(),
                     ) {
                         Ok(first) => {
                             tracing::info!("Mixed prefill first token: {first}");
@@ -139,7 +141,6 @@ pub(super) fn run_standard_chunk_loop(
                     code_fence_token,
                     tool_call_start_token,
                     tool_call_end_token,
-                    reflection_suppress_ids,
                     adaptive_sampling,
                 );
                 *did_mixed_step = true;
@@ -190,13 +191,16 @@ pub(super) fn run_standard_chunk_loop(
             if is_last {
                 let _ = model.record_event(prefill_event, prefill_stream);
                 let _ = model.stream_wait_event(model.default_stream(), prefill_event);
-                match sample_token(
+                // #131: grammar-constrain the FIRST token (and advance the
+                // matcher); no-op without a grammar.
+                match sample_first_token(
                     model,
                     logits,
                     p.temperature,
                     p.top_k,
                     p.top_p,
                     &p.eos_tokens,
+                    p.grammar_state.as_mut(),
                 ) {
                     Ok(first) => {
                         tracing::info!("Prefill first token: {first}");
