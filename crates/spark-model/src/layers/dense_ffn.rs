@@ -10,7 +10,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layer::ForwardContext;
 use crate::layers::ops;
-use crate::weight_map::{DenseWeight, QuantizedWeight};
+use crate::weight_map::{DenseWeight, Fp8Weight, Fp8WeightTransposed, QuantizedWeight};
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
@@ -34,6 +34,16 @@ pub struct DenseFfnWeightsBf16 {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+}
+
+/// Native block-scaled FP8 dense MLP weights — loaded directly from an FP8
+/// checkpoint (no NVFP4 requant). When installed via `set_fp8_weights`, decode
+/// dispatches `w8a16_gemv` and prefill `w8a16_gemm` per projection (BF16 act ×
+/// FP8 E4M3 weight with 2D block scales), mirroring the SSM/attention FP8 path.
+pub struct DenseFfnWeightsFp8 {
+    pub gate_proj: Fp8Weight,
+    pub up_proj: Fp8Weight,
+    pub down_proj: Fp8Weight,
 }
 
 /// Activation function for gated FFN (SiLU for Qwen/Llama, GELU for Gemma-4).
@@ -159,8 +169,11 @@ pub struct DenseFfnLayer {
     nvfp4_quant_act_k: KernelHandle,
     nvfp4_repack_k: KernelHandle,
     nvfp4_silu_scaled_k: KernelHandle,
+    nvfp4_silu_quant_k: KernelHandle,
+    nvfp4_scale_k: KernelHandle,
     fp4mmq_gate: std::sync::OnceLock<Fp4MmqWeight>,
     fp4mmq_up: std::sync::OnceLock<Fp4MmqWeight>,
+    fp4mmq_down: std::sync::OnceLock<Fp4MmqWeight>,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
@@ -178,6 +191,23 @@ pub struct DenseFfnLayer {
     // KernelHandle(0) on miss → forward_prefill falls back to the scalar path.
     // Decode (gemv, M=1) is untouched, so TPOT is unaffected.
     dense_gemm_tc_k: KernelHandle,
+    /// Native FP8 dense MLP weights — when `Some`, decode/prefill dispatch the
+    /// block-scaled FP8 kernels (`w8a16_gemv` / `w8a16_gemm`) instead of w4a16
+    /// NVFP4. Set via `set_fp8_weights` for native FP8 checkpoints (Qwythos /
+    /// Ornith-FP8). Spec-decode batched paths fall back to dequant — dense
+    /// qwen3_5 has no MTP, so they're never reached.
+    fp8_weights: Option<DenseFfnWeightsFp8>,
+    w8a16_gemv_k: KernelHandle,
+    w8a16_gemm_k: KernelHandle,
+    // Fused FP8 decode GEMVs (gate+up in one launch / silu+down in one launch),
+    // mirroring the NVFP4 w4a16_gemv_dual / w4a16_gemv_silu_input. KernelHandle(0)
+    // on miss → fall back to the 3-launch w8a16_gemv path. Module = .cu file stem.
+    w8a16_gemv_dual_k: KernelHandle,
+    w8a16_gemv_silu_input_k: KernelHandle,
+    // Fast transposed FP8 prefill GEMM (128x128 / 8-warp / two-level FP32 fold).
+    // Preferred over w8a16_gemm when a transposed FP8 weight copy is present.
+    // KernelHandle(0) → fall back to non-transposed w8a16_gemm.
+    w8a16_gemm_t_m128_k: KernelHandle,
 }
 
 impl DenseFfnLayer {
@@ -252,13 +282,26 @@ impl DenseFfnLayer {
             nvfp4_quant_act_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_quantize_bf16"),
             nvfp4_repack_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_repack"),
             nvfp4_silu_scaled_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_silu_mul_scaled"),
+            nvfp4_silu_quant_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_silu_mul_quant"),
+            nvfp4_scale_k: super::try_kernel(gpu, "nvfp4_mmq", "atlas_nvfp4_scale_bf16"),
             fp4mmq_gate: std::sync::OnceLock::new(),
             fp4mmq_up: std::sync::OnceLock::new(),
+            fp4mmq_down: std::sync::OnceLock::new(),
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
             dense_gemm_bf16_k,
             dense_gemm_tc_k,
+            fp8_weights: None,
+            w8a16_gemv_k: super::try_kernel(gpu, "w8a16_gemv", "w8a16_gemv"),
+            w8a16_gemm_k: super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
+            w8a16_gemv_dual_k: super::try_kernel(gpu, "w8a16_gemv_fused", "w8a16_gemv_dual"),
+            w8a16_gemv_silu_input_k: super::try_kernel(
+                gpu,
+                "w8a16_gemv_fused",
+                "w8a16_gemv_silu_input",
+            ),
+            w8a16_gemm_t_m128_k: super::try_kernel(gpu, "w8a16_gemm_t_m128", "w8a16_gemm_t_m128"),
         };
         Ok(layer)
     }
@@ -351,11 +394,24 @@ impl DenseFfnLayer {
         }
         self.ensure_nvfp4_mmq_weight(&self.fp4mmq_gate, gpu, &self.weights.gate_proj, inter, h, stream)?;
         self.ensure_nvfp4_mmq_weight(&self.fp4mmq_up, gpu, &self.weights.up_proj, inter, h, stream)?;
+        let down_mmq = std::env::var_os("ATLAS_FFN_NVFP4_MMQ_DOWN").is_some();
+        if down_mmq {
+            self.ensure_nvfp4_mmq_weight(&self.fp4mmq_down, gpu, &self.weights.down_proj, h, inter, stream)?;
+        }
         gpu.synchronize(stream)?;
-        // Free the dead gate/up transposed copies (gate/up prefill now on the MMQ arm;
-        // decode reads the non-transposed originals; down keeps down_proj_t).
+        // Free the dead transposed copies (prefill for those projections now runs on the
+        // MMQ arm; decode reads the non-transposed originals). down_proj_t is freed only
+        // when the down A/B gate is on.
+        let mut down_t = if down_mmq {
+            Some(&mut self.weights.down_proj_t)
+        } else {
+            None
+        };
         let mut freed = 0usize;
-        for wt in [&mut self.weights.gate_proj_t, &mut self.weights.up_proj_t] {
+        for wt in [&mut self.weights.gate_proj_t, &mut self.weights.up_proj_t]
+            .into_iter()
+            .chain(down_t.take().into_iter())
+        {
             if let Some(w) = wt.as_ref() {
                 if !w.weight.is_null() {
                     gpu.free(w.weight)?;
@@ -408,6 +464,18 @@ impl DenseFfnLayer {
             let _ = gpu.free(dup.w);
         }
         Ok(*cell.get().expect("fp4mmq weight cell set above"))
+    }
+
+    /// Install native block-scaled FP8 dense MLP weights. After this call the
+    /// forward paths dispatch `w8a16_gemv` (decode) / `w8a16_gemm` (prefill)
+    /// instead of w4a16 NVFP4. Caller must ensure those kernels are present in
+    /// the target (they are for the qwen3_5/ornith nvfp4 bundle).
+    pub fn set_fp8_weights(&mut self, gate: Fp8Weight, up: Fp8Weight, down: Fp8Weight) {
+        self.fp8_weights = Some(DenseFfnWeightsFp8 {
+            gate_proj: gate,
+            up_proj: up,
+            down_proj: down,
+        });
     }
 
     /// Install BF16 dense MLP weights. After this call, the forward paths
@@ -521,6 +589,90 @@ impl DenseFfnLayer {
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
+
+        // FP8 dispatch: prefer the fused FP8 dual-GEMV (gate+up in one launch) +
+        // SiLU-fused down GEMV, mirroring the NVFP4 path. Collapses gate+up+
+        // silu_mul+down (4 launches) to dual+silu (2). Falls back to the
+        // 3-launch per-projection `w8a16_gemv` path when the fused kernels or a
+        // non-SiLU activation make the fast path unavailable.
+        if let Some(ref fp8w) = self.fp8_weights {
+            let output = ctx.buffers.moe_output();
+            if self.activation == FfnActivation::SiLU
+                && self.w8a16_gemv_dual_k.0 != 0
+                && self.w8a16_gemv_silu_input_k.0 != 0
+            {
+                ops::w8a16_gemv_dual(
+                    ctx.gpu,
+                    self.w8a16_gemv_dual_k,
+                    input,
+                    fp8w.gate_proj.weight,
+                    fp8w.gate_proj.row_scale,
+                    gate_out,
+                    fp8w.up_proj.weight,
+                    fp8w.up_proj.row_scale,
+                    up_out,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                ops::w8a16_gemv_silu_input(
+                    ctx.gpu,
+                    self.w8a16_gemv_silu_input_k,
+                    gate_out,
+                    up_out,
+                    fp8w.down_proj.weight,
+                    fp8w.down_proj.row_scale,
+                    output,
+                    h,
+                    inter,
+                    stream,
+                )?;
+                return Ok(output);
+            }
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                input,
+                fp8w.gate_proj.weight,
+                fp8w.gate_proj.row_scale,
+                gate_out,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                input,
+                fp8w.up_proj.weight,
+                fp8w.up_proj.row_scale,
+                up_out,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                inter,
+                stream,
+            )?;
+            ops::w8a16_gemv(
+                ctx.gpu,
+                self.w8a16_gemv_k,
+                gate_out,
+                fp8w.down_proj.weight,
+                fp8w.down_proj.row_scale,
+                output,
+                h,
+                inter,
+                stream,
+            )?;
+            return Ok(output);
+        }
 
         // BF16 dispatch: per-projection GEMV via `dense_gemv_bf16`. We
         // don't have a fused dual-BF16-GEMV kernel today; two sequential
@@ -769,6 +921,68 @@ impl DenseFfnLayer {
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
 
+        // FP8 prefill dispatch: per-projection block-scaled E4M3 weight × BF16
+        // act. Prefer the fast transposed `w8a16_gemm_t_m128` (128x128 / 8-warp /
+        // two-level FP32 fold) when a transposed FP8 weight copy is available;
+        // fall back to the non-transposed `w8a16_gemm`. `DenseFfnWeightsFp8`
+        // currently stores only non-transposed weights, so the fallback is taken
+        // here today — the m128 preference engages once a `*_proj_t` FP8 copy is
+        // installed (the kernel + handle are wired and ship via common/).
+        if let Some(ref fp8w) = self.fp8_weights {
+            // helper: transposed m128 when a B_t copy + handle are present, else
+            // non-transposed w8a16_gemm.
+            macro_rules! w8_gemm {
+                ($w:expr, $wt:expr, $in:expr, $out:expr, $n:expr, $k:expr) => {
+                    match $wt {
+                        Some(wt) if self.w8a16_gemm_t_m128_k.0 != 0 => {
+                            let wt: Fp8WeightTransposed = wt;
+                            ops::w8a16_gemm_n128_m128(
+                                ctx.gpu,
+                                self.w8a16_gemm_t_m128_k,
+                                $in,
+                                wt.weight_t,
+                                wt.scale_t,
+                                $out,
+                                m,
+                                $n,
+                                $k,
+                                stream,
+                            )?
+                        }
+                        _ => ops::w8a16_gemm(
+                            ctx.gpu,
+                            self.w8a16_gemm_k,
+                            $in,
+                            $w.weight,
+                            $w.row_scale,
+                            $out,
+                            m,
+                            $n,
+                            $k,
+                            stream,
+                        )?,
+                    }
+                };
+            }
+            let gate_t: Option<Fp8WeightTransposed> = None;
+            let up_t: Option<Fp8WeightTransposed> = None;
+            let down_t: Option<Fp8WeightTransposed> = None;
+            w8_gemm!(fp8w.gate_proj, gate_t, input, gate_out, inter, h);
+            w8_gemm!(fp8w.up_proj, up_t, input, up_out, inter, h);
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                m * inter,
+                stream,
+            )?;
+            let output = ctx.buffers.moe_output();
+            w8_gemm!(fp8w.down_proj, down_t, gate_out, output, h, inter);
+            return Ok(());
+        }
+
         // BF16 prefill dispatch. Prefer the tensor-core m16n8k16 MMA kernel
         // (`dense_gemm_tc`, 3-5x+ over scalar) — the scalar `dense_gemm_bf16`
         // was the flat ~155 tok/s prefill bottleneck on Qwen3.6-27B dense
@@ -884,6 +1098,14 @@ impl DenseFfnLayer {
                 );
             });
         }
+        // Down-projection A/B extension (ATLAS_FFN_NVFP4_MMQ_DOWN=1): route down through
+        // the same MMQ arm (t_m128 runs the narrow-N down at only ~34 TFLOP/s in-model).
+        // Accuracy note: down W4A4 cosine 0.9961 (random) — better than the previously
+        // coherence-validated all-W4A4 config (0.991) — but still the heavy-tailed
+        // projection, so it stays a SEPARATE opt-in gate.
+        let fp4mmq_down = fp4mmq_prefill
+            && self.nvfp4_scale_k.0 != 0
+            && std::env::var_os("ATLAS_FFN_NVFP4_MMQ_DOWN").is_some();
         // HYBRID: route the accuracy-critical down_proj OFF Q4_K onto the near-lossless faith2
         // NVFP4 path (W4A8 requant, cos 0.99998). down=SiLU(gate)*up is heavy-tailed; Q4_K
         // superblock scaling clips it (BFCL `multiple` -4.0%; llama promotes only down→Q6_K for
@@ -973,13 +1195,13 @@ impl DenseFfnLayer {
         };
 
         macro_rules! w4_gemm {
-            ($w:expr, $wt:expr, $cell:expr, $qcell:expr, $fp4cell:expr, $in:expr, $out:expr, $n:expr, $k:expr, $allow_q4k:expr) => {
+            ($w:expr, $wt:expr, $cell:expr, $qcell:expr, $fp4cell:expr, $allow_fp4:expr, $in:expr, $out:expr, $n:expr, $k:expr, $allow_q4k:expr) => {
                 match $wt {
-                    // NVFP4 W4A4 MMQ prefill (ATLAS_FFN_NVFP4_MMQ) — HIGHEST priority,
-                    // gate/up only (`$allow_q4k` false for down → falls to the default path).
-                    // Activation pre-quantized ONCE into `fp4_y` by the caller; the output
-                    // is missing ×scale2, folded downstream in the scaled SiLU-mul.
-                    _ if fp4mmq_prefill && $allow_q4k => {
+                    // NVFP4 W4A4 MMQ prefill (ATLAS_FFN_NVFP4_MMQ) — HIGHEST priority.
+                    // `$allow_fp4` = fp4mmq_prefill for gate/up, fp4mmq_down for down.
+                    // Activation pre-quantized into `fp4_y` by the caller; the output is
+                    // missing ×scale2, folded downstream (scaled SiLU-mul / scale_bf16).
+                    _ if $allow_fp4 => {
                         let _ = $in;
                         let qw =
                             self.ensure_nvfp4_mmq_weight($fp4cell, ctx.gpu, $w, $n, $k, stream)?;
@@ -1149,6 +1371,7 @@ impl DenseFfnLayer {
             &self.int8_gate,
             &self.q4k_gate,
             &self.fp4mmq_gate,
+            fp4mmq_prefill,
             input,
             gate_out,
             inter,
@@ -1162,6 +1385,7 @@ impl DenseFfnLayer {
             &self.int8_up,
             &self.q4k_up,
             &self.fp4mmq_up,
+            fp4mmq_prefill,
             input,
             up_out,
             inter,
@@ -1170,7 +1394,25 @@ impl DenseFfnLayer {
         );
 
         // activation(gate) * up for all M tokens (SiLU or GELU)
-        if fp4mmq_prefill {
+        let fused_down_quant = fp4mmq_down && self.nvfp4_silu_quant_k.0 != 0;
+        if fused_down_quant {
+            // Fused SiLU-mul + quantize straight into the down MMQ's y-format: the
+            // [M, inter] bf16 intermediate is never written or re-read (that round-trip
+            // is why the unfused down arm measured neutral). scale2 folds happen inside,
+            // pre-clamp — identical math to the two-step path below.
+            ops::nvfp4_silu_mul_quant(
+                ctx.gpu,
+                self.nvfp4_silu_quant_k,
+                gate_out,
+                up_out,
+                fp4_y,
+                self.weights.gate_proj.weight_scale_2,
+                self.weights.up_proj.weight_scale_2,
+                m,
+                inter,
+                stream,
+            )?;
+        } else if fp4mmq_prefill {
             // FP4-MMQ outputs are missing the per-tensor FP32 scale2 (the hardware MMA
             // applies only the per-16 e4m3 scales) — fold it here, before the nonlinearity.
             ops::nvfp4_silu_mul_scaled(
@@ -1214,6 +1456,11 @@ impl DenseFfnLayer {
         if q4k_prefill && !down_faith2 {
             ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, gate_out, q4k_a, m, inter, stream)?;
         }
+        // FP4-MMQ down (two-step fallback, only when the fused kernel is absent):
+        // quantize the down input (SiLU(gate)*up, `[M, inter]`) to block_fp4_mmq.
+        if fp4mmq_down && !fused_down_quant {
+            ops::nvfp4_mmq_quantize_act(ctx.gpu, self.nvfp4_quant_act_k, gate_out, fp4_y, m, inter, stream)?;
+        }
         // down_proj GEMM: [M, inter] → [M, H]
         // ($fp4cell is a placeholder — the FP4-MMQ arm is gated off by `false` below;
         // down stays on the default path in the FP4-MMQ hybrid.)
@@ -1223,13 +1470,26 @@ impl DenseFfnLayer {
             self.weights.down_proj_t,
             &self.int8_down,
             &self.q4k_down,
-            &self.fp4mmq_gate,
+            &self.fp4mmq_down,
+            fp4mmq_down,
             gate_out,
             output,
             h,
             inter,
             false
         );
+        // FP4-MMQ down: fold the down-projection's per-tensor scale2 (no SiLU-mul here;
+        // the consumer is the residual add).
+        if fp4mmq_down {
+            ops::nvfp4_scale_bf16(
+                ctx.gpu,
+                self.nvfp4_scale_k,
+                output,
+                self.weights.down_proj.weight_scale_2,
+                m * h,
+                stream,
+            )?;
+        }
 
         Ok(())
     }
