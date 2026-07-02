@@ -273,7 +273,11 @@ impl DenseFfnLayer {
             q4k_mmq_wc_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_wc"),
             q4k_quant_act_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q8_1_quantize_ds4_bf16"),
             q4k_quant_w_k: super::try_kernel(gpu, "q4k_quantize", "q4k_quantize"),
-            dequant_nvfp4_bf16_k: super::try_kernel(gpu, "dequant_nvfp4_bf16", "dequant_nvfp4_to_bf16"),
+            dequant_nvfp4_bf16_k: super::try_kernel(
+                gpu,
+                "dequant_nvfp4_bf16",
+                "dequant_nvfp4_to_bf16",
+            ),
             q4k_gate: std::sync::OnceLock::new(),
             q4k_up: std::sync::OnceLock::new(),
             q4k_down: std::sync::OnceLock::new(),
@@ -333,15 +337,36 @@ impl DenseFfnLayer {
         // (sized after load) can't claim the freed space before the weights exist.
         // gate/up: Q4_K (N=inter,K=h). down: HYBRID → int8 faith2 (N=h,K=inter) for accuracy,
         // else Q4_K. ensure_int8_weight reads the non-`_t` NVFP4 down_proj (kept for decode gemv).
-        self.ensure_q4k_weight(&self.q4k_gate, gpu, &self.weights.gate_proj, inter, h, stream)?;
+        self.ensure_q4k_weight(
+            &self.q4k_gate,
+            gpu,
+            &self.weights.gate_proj,
+            inter,
+            h,
+            stream,
+        )?;
         self.ensure_q4k_weight(&self.q4k_up, gpu, &self.weights.up_proj, inter, h, stream)?;
         let down_faith2 = self.int8_faith2_k.0 != 0
             && self.requant_a_int8_k.0 != 0
             && std::env::var_os("ATLAS_FFN_MMQ_DOWN_Q4K").is_none();
         if down_faith2 {
-            self.ensure_int8_weight(&self.int8_down, gpu, &self.weights.down_proj, h, inter, stream)?;
+            self.ensure_int8_weight(
+                &self.int8_down,
+                gpu,
+                &self.weights.down_proj,
+                h,
+                inter,
+                stream,
+            )?;
         } else {
-            self.ensure_q4k_weight(&self.q4k_down, gpu, &self.weights.down_proj, h, inter, stream)?;
+            self.ensure_q4k_weight(
+                &self.q4k_down,
+                gpu,
+                &self.weights.down_proj,
+                h,
+                inter,
+                stream,
+            )?;
         }
         gpu.synchronize(stream)?;
         // (2) free the dead transposed copies
@@ -351,12 +376,12 @@ impl DenseFfnLayer {
             &mut self.weights.up_proj_t,
             &mut self.weights.down_proj_t,
         ] {
-            if let Some(w) = wt.as_ref() {
-                if !w.weight.is_null() {
-                    gpu.free(w.weight)?;
-                    gpu.free(w.weight_scale)?;
-                    freed += 1;
-                }
+            if let Some(w) = wt.as_ref()
+                && !w.weight.is_null()
+            {
+                gpu.free(w.weight)?;
+                gpu.free(w.weight_scale)?;
+                freed += 1;
             }
             *wt = None;
         }
@@ -388,15 +413,36 @@ impl DenseFfnLayer {
             && self.nvfp4_repack_k.0 != 0
             && self.nvfp4_silu_scaled_k.0 != 0
             && matches!(self.activation, FfnActivation::SiLU)
-            && std::env::var_os("ATLAS_FFN_NVFP4_MMQ").is_some();
+            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none();
         if !active {
             return Ok(());
         }
-        self.ensure_nvfp4_mmq_weight(&self.fp4mmq_gate, gpu, &self.weights.gate_proj, inter, h, stream)?;
-        self.ensure_nvfp4_mmq_weight(&self.fp4mmq_up, gpu, &self.weights.up_proj, inter, h, stream)?;
-        let down_mmq = std::env::var_os("ATLAS_FFN_NVFP4_MMQ_DOWN").is_some();
+        self.ensure_nvfp4_mmq_weight(
+            &self.fp4mmq_gate,
+            gpu,
+            &self.weights.gate_proj,
+            inter,
+            h,
+            stream,
+        )?;
+        self.ensure_nvfp4_mmq_weight(
+            &self.fp4mmq_up,
+            gpu,
+            &self.weights.up_proj,
+            inter,
+            h,
+            stream,
+        )?;
+        let down_mmq = std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ_DOWN").is_none();
         if down_mmq {
-            self.ensure_nvfp4_mmq_weight(&self.fp4mmq_down, gpu, &self.weights.down_proj, h, inter, stream)?;
+            self.ensure_nvfp4_mmq_weight(
+                &self.fp4mmq_down,
+                gpu,
+                &self.weights.down_proj,
+                h,
+                inter,
+                stream,
+            )?;
         }
         gpu.synchronize(stream)?;
         // Free the dead transposed copies (prefill for those projections now runs on the
@@ -412,12 +458,12 @@ impl DenseFfnLayer {
             .into_iter()
             .chain(down_t.take().into_iter())
         {
-            if let Some(w) = wt.as_ref() {
-                if !w.weight.is_null() {
-                    gpu.free(w.weight)?;
-                    gpu.free(w.weight_scale)?;
-                    freed += 1;
-                }
+            if let Some(w) = wt.as_ref()
+                && !w.weight.is_null()
+            {
+                gpu.free(w.weight)?;
+                gpu.free(w.weight_scale)?;
+                freed += 1;
             }
             *wt = None;
         }
@@ -1058,8 +1104,8 @@ impl DenseFfnLayer {
         // e4m3 M64 kernel (~1.47x vs v2 BF16, smem-relieved). Lossy (cosine 0.9997)
         // → highest priority when set, so it overrides the BF16/FP8 t_m128 arms.
         // PCND: explicit opt-in, default off = byte-for-byte prior behavior.
-        let fp8_m64_prefill = self.w4a16_gemm_t_k.0 != 0
-            && std::env::var_os("ATLAS_FP8_M64_PREFILL").is_some();
+        let fp8_m64_prefill =
+            self.w4a16_gemm_t_k.0 != 0 && std::env::var_os("ATLAS_FP8_M64_PREFILL").is_some();
         // int8 W4A8 fast-prefill opt-in (ATLAS_INT8_PREFILL): route prefill GEMMs
         // through the validated requant→`int8_gemm_faith2` pipeline (cosine
         // 0.999978 vs the host full-precision dequant GEMM). HIGHEST priority when
@@ -1089,7 +1135,7 @@ impl DenseFfnLayer {
             && self.nvfp4_quant_act_k.0 != 0
             && self.nvfp4_silu_scaled_k.0 != 0
             && matches!(self.activation, FfnActivation::SiLU)
-            && std::env::var_os("ATLAS_FFN_NVFP4_MMQ").is_some();
+            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ").is_none();
         if fp4mmq_prefill {
             static FP4MMQ_LOG: std::sync::Once = std::sync::Once::new();
             FP4MMQ_LOG.call_once(|| {
@@ -1098,14 +1144,14 @@ impl DenseFfnLayer {
                 );
             });
         }
-        // Down-projection A/B extension (ATLAS_FFN_NVFP4_MMQ_DOWN=1): route down through
+        // Down-projection MMQ arm (DEFAULT ON; kill-switch ATLAS_NO_FFN_NVFP4_MMQ_DOWN=1): route down through
         // the same MMQ arm (t_m128 runs the narrow-N down at only ~34 TFLOP/s in-model).
         // Accuracy note: down W4A4 cosine 0.9961 (random) — better than the previously
         // coherence-validated all-W4A4 config (0.991) — but still the heavy-tailed
         // projection, so it stays a SEPARATE opt-in gate.
         let fp4mmq_down = fp4mmq_prefill
             && self.nvfp4_scale_k.0 != 0
-            && std::env::var_os("ATLAS_FFN_NVFP4_MMQ_DOWN").is_some();
+            && std::env::var_os("ATLAS_NO_FFN_NVFP4_MMQ_DOWN").is_none();
         // HYBRID: route the accuracy-critical down_proj OFF Q4_K onto the near-lossless faith2
         // NVFP4 path (W4A8 requant, cos 0.99998). down=SiLU(gate)*up is heavy-tailed; Q4_K
         // superblock scaling clips it (BFCL `multiple` -4.0%; llama promotes only down→Q6_K for
@@ -1263,9 +1309,7 @@ impl DenseFfnLayer {
                     // scratch. Lossy (cosine ~0.99998). Also the HYBRID down path
                     // (down_faith2 && !$allow_q4k): down falls here instead of Q4_K.
                     _ if int8_prefill || (down_faith2 && !$allow_q4k) => {
-                        let iw = self.ensure_int8_weight(
-                            $cell, ctx.gpu, $w, $n, $k, stream,
-                        )?;
+                        let iw = self.ensure_int8_weight($cell, ctx.gpu, $w, $n, $k, stream)?;
                         ops::int8_gemm_faith2_prefill(
                             ctx.gpu,
                             self.int8_faith2_k,
@@ -1362,7 +1406,15 @@ impl DenseFfnLayer {
         }
         // FP4-MMQ: quantize the gate/up SHARED input `[M, H]` to block_fp4_mmq ONCE.
         if fp4mmq_prefill {
-            ops::nvfp4_mmq_quantize_act(ctx.gpu, self.nvfp4_quant_act_k, input, fp4_y, m, h, stream)?;
+            ops::nvfp4_mmq_quantize_act(
+                ctx.gpu,
+                self.nvfp4_quant_act_k,
+                input,
+                fp4_y,
+                m,
+                h,
+                stream,
+            )?;
         }
         // gate_proj GEMM: [M, H] → [M, inter]
         w4_gemm!(
@@ -1454,12 +1506,28 @@ impl DenseFfnLayer {
         // Q4_K opt: quantize the down input (SiLU(gate)*up, `[M, inter]`) to q8_1.
         // Skip when the hybrid routes down to faith2 (it does its own int8 requant).
         if q4k_prefill && !down_faith2 {
-            ops::quantize_act_q8_1(ctx.gpu, self.q4k_quant_act_k, gate_out, q4k_a, m, inter, stream)?;
+            ops::quantize_act_q8_1(
+                ctx.gpu,
+                self.q4k_quant_act_k,
+                gate_out,
+                q4k_a,
+                m,
+                inter,
+                stream,
+            )?;
         }
         // FP4-MMQ down (two-step fallback, only when the fused kernel is absent):
         // quantize the down input (SiLU(gate)*up, `[M, inter]`) to block_fp4_mmq.
         if fp4mmq_down && !fused_down_quant {
-            ops::nvfp4_mmq_quantize_act(ctx.gpu, self.nvfp4_quant_act_k, gate_out, fp4_y, m, inter, stream)?;
+            ops::nvfp4_mmq_quantize_act(
+                ctx.gpu,
+                self.nvfp4_quant_act_k,
+                gate_out,
+                fp4_y,
+                m,
+                inter,
+                stream,
+            )?;
         }
         // down_proj GEMM: [M, inter] → [M, H]
         // ($fp4cell is a placeholder — the FP4-MMQ arm is gated off by `false` below;
