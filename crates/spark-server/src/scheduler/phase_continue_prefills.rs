@@ -68,14 +68,11 @@ pub(super) fn continue_in_progress_prefills(
         // Resolve batch MoE top-k for the mixed/prefill forward.
         let batch_moe_k = active
             .iter()
-            .filter_map(|a| a.moe_top_k)
-            .chain(p.moe_top_k)
             .min()
             .unwrap_or(0);
         let use_twophase = p.chunk_offset == 0 && p.prompt_tokens.len() > max_prefill_tokens;
         if use_twophase {
             if batch_moe_k > 0 {
-                model.set_moe_top_k(batch_moe_k);
             }
             tracing::info!(
                 "Two-phase prefill: {} tokens, chunk_size={}",
@@ -211,8 +208,6 @@ fn run_standard_chunk_loop(
             // Resolve per-request MoE top-k (before mutable borrow on active).
             let batch_k = active
                 .iter()
-                .filter_map(|a| a.moe_top_k)
-                .chain(p.moe_top_k)
                 .min()
                 .unwrap_or(0);
             let decode_tokens: Vec<u32> = active.iter().map(|a| a.last_token).collect();
@@ -221,7 +216,6 @@ fn run_standard_chunk_loop(
             let t0_mixed = Instant::now();
 
             if batch_k > 0 {
-                model.set_moe_top_k(batch_k);
             }
 
             match model.mixed_forward(
@@ -312,12 +306,9 @@ fn run_standard_chunk_loop(
 
         let batch_k = active
             .iter()
-            .filter_map(|a| a.moe_top_k)
-            .chain(p.moe_top_k)
             .min()
             .unwrap_or(0);
         if batch_k > 0 {
-            model.set_moe_top_k(batch_k);
         }
         match model.prefill_chunk(
             &p.prompt_tokens,

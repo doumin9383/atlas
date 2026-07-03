@@ -6,8 +6,6 @@ use super::*;
 
 /// K=3 verify: [last_token, draft1, draft2] → [v0, v1, v2]. Three outcomes.
 pub fn step_verify_k3(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_drafts: usize) {
-    if let Some(k) = a.moe_top_k {
-        model.set_moe_top_k(k);
     }
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");

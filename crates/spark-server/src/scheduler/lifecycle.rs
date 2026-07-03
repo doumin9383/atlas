@@ -217,7 +217,6 @@ pub fn swap_out_sequence(
         top_logprobs: a.top_logprobs,
         logprobs_data: a.logprobs_data,
         timeout_at: a.timeout_at,
-        moe_top_k: a.moe_top_k,
         swap_id,
         cached_prompt_tokens: a.cached_prompt_tokens,
     })
@@ -306,7 +305,6 @@ pub fn resume_swapped_seq(
         top_logprobs: s.top_logprobs,
         logprobs_data: s.logprobs_data,
         timeout_at: s.timeout_at,
-        moe_top_k: s.moe_top_k,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(s.temperature),
         cached_prompt_tokens: s.cached_prompt_tokens,
     })

@@ -55,7 +55,6 @@ fn test_forward_context_lifetime() {
         profile: false,
         comm: None,
         graph_capture: false,
-        moe_top_k: config.num_experts_per_tok as u32,
     };
 
     assert_eq!(ctx.config.hidden_size, 2048);

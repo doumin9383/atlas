@@ -86,7 +86,6 @@ impl TransformerModel {
             profile: false,
             comm: None,
             graph_capture: false,
-            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
         let prop_state = seq
             .proposer_state

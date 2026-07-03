@@ -58,7 +58,6 @@ pub fn start_chunked_prefill(
     let req_top_logprobs = req.top_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let req_moe_top_k = req.moe_top_k();
     let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature) = match req {
         InferenceRequest::Streaming {
@@ -134,8 +133,6 @@ pub fn start_chunked_prefill(
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
-        if let Some(k) = req_moe_top_k {
-            model.set_moe_top_k(k);
         }
         model.prefill_chunk(
             &prompt_tokens,
@@ -276,7 +273,6 @@ pub fn start_chunked_prefill(
                 top_logprobs: req_top_logprobs,
                 logprobs_data: Vec::new(),
                 timeout_at: req_timeout_at,
-                moe_top_k: req_moe_top_k,
                 adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
             };
             finish_sequence(model, &mut a);
@@ -357,7 +353,6 @@ pub fn start_chunked_prefill(
                 top_logprobs: req_top_logprobs,
                 logprobs_data: Vec::new(),
                 timeout_at: req_timeout_at,
-                moe_top_k: req_moe_top_k,
                 adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
             }))
         }
@@ -399,7 +394,6 @@ pub fn start_chunked_prefill(
             grammar_state,
             seed: req_seed,
             top_logprobs: req_top_logprobs,
-            moe_top_k: req_moe_top_k,
             timeout_at: req_timeout_at,
         }))
     }

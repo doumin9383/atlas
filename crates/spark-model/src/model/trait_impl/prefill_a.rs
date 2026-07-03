@@ -363,7 +363,6 @@ impl TransformerModel {
             num_seqs: 1,
         };
 
-        let moe_top_k = self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed);
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
@@ -372,7 +371,6 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: false,
-            moe_top_k,
         };
 
         // ── 4. Forward through all layers ──

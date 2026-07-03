@@ -35,7 +35,7 @@ impl MtpHead {
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
-        let top_k = ctx.moe_top_k;
+        let top_k = crate::moe_top_k::resolve_or(ctx.config.num_experts_per_tok as u32);
 
         // 1. Gate GEMV: [1,h] → [1,num_experts] (always BF16 weights)
         let gate_logits = ctx.buffers.gate_logits();

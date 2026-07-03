@@ -27,7 +27,7 @@ impl MoeLayer {
         let inter = ctx.config.moe_intermediate_size as u32;
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
-        let top_k = ctx.moe_top_k;
+        let top_k = crate::moe_top_k::resolve_or(ctx.config.num_experts_per_tok as u32);
         let n = num_tokens as u32;
         let total_expanded = n * top_k;
         let ne = num_experts as usize;

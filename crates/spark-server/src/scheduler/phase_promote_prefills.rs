@@ -180,7 +180,6 @@ fn build_active_seq_from_prefill(
         top_logprobs: p.top_logprobs,
         logprobs_data: Vec::new(),
         timeout_at: p.timeout_at,
-        moe_top_k: p.moe_top_k,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
     }
 }

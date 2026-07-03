@@ -298,10 +298,7 @@ impl InferenceRequest {
     }
 
     /// MoE expert top-k override. None = use model config default.
-    pub fn moe_top_k(&self) -> Option<u32> {
         match self {
-            InferenceRequest::Blocking { moe_top_k, .. } => *moe_top_k,
-            InferenceRequest::Streaming { moe_top_k, .. } => *moe_top_k,
         }
     }
 }

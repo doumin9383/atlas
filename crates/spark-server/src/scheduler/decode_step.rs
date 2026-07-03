@@ -56,9 +56,7 @@ pub fn step_decode_only(
     }
 
     // Resolve per-request MoE top-k override (before mutable borrow).
-    let moe_k = active.iter().filter_map(|a| a.moe_top_k).min().unwrap_or(0);
     if moe_k > 0 {
-        model.set_moe_top_k(moe_k);
     }
 
     let mut refs: Vec<&mut SequenceState> = active.iter_mut().map(|a| &mut a.seq).collect();

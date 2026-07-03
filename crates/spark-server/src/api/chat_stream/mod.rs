@@ -76,7 +76,6 @@ pub(crate) async fn chat_completions_stream(
     seed: Option<u64>,
     top_logprobs: Option<u8>,
     timeout_at: Option<std::time::Instant>,
-    moe_top_k: Option<u32>,
     stop_strings: Vec<String>,
     req_stream_include_usage: bool,
     req_service_tier: Option<String>,
@@ -132,7 +131,6 @@ pub(crate) async fn chat_completions_stream(
         seed,
         top_logprobs,
         timeout_at,
-        moe_top_k,
         token_tx,
     };
 

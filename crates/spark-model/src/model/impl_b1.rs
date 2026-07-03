@@ -272,7 +272,6 @@ impl TransformerModel {
                 profile: false,
                 comm: ctx.comm,
                 graph_capture: ctx.graph_capture,
-                moe_top_k: ctx.moe_top_k,
             }
 
         };
@@ -456,7 +455,6 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: false, // Eager mode — no CUDA graph
-            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only

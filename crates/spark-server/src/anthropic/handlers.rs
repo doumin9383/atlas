@@ -74,6 +74,7 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Byte
 
     let stream = req.stream;
     let model_echo = req.model.clone();
+    spark_model::moe_top_k::set(req.moe_top_k.unwrap_or(0));
 
     // 2. --dump: capture the raw Anthropic body. We mint our own seq so
     //    the entry shows endpoint="/v1/messages"; chat_completions_inner

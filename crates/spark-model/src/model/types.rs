@@ -211,7 +211,6 @@ pub struct TransformerModel {
     /// Per-request MoE expert top-k override. Set by the scheduler before
     /// each forward pass. 0 means "use config.num_experts_per_tok".
     /// Must be ≤ config.num_experts_per_tok (buffer capacity).
-    pub(super) moe_top_k: std::sync::atomic::AtomicU32,
 }
 
 /// Pinned host memory staging buffer with reusable metadata Vecs.

@@ -114,6 +114,7 @@ pub async fn completions(
             .collect()
     });
     let stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);
+    spark_model::moe_top_k::set(req.moe_top_k.unwrap_or(0));
 
     if req.stream {
         return match completions_stream(
@@ -131,7 +132,6 @@ pub async fn completions(
             logit_bias.clone(),
             stop_tokens,
             req.seed,
-            req.moe_top_k,
         )
         .await
         {
@@ -182,7 +182,6 @@ pub async fn completions(
                 None
             }
         },
-        moe_top_k: req.moe_top_k,
         response_tx: tx,
     };
 
@@ -270,7 +269,6 @@ pub(super) async fn completions_stream(
     logit_bias: Vec<(u32, f32)>,
     stop_tokens: Vec<u32>,
     seed: Option<u64>,
-    moe_top_k: Option<u32>,
 ) -> Result<Response, (StatusCode, String)> {
     // Match chat_stream/mod.rs sizing; see comment there.
     let (token_tx, token_rx) = tokio::sync::mpsc::channel::<StreamEvent>(1024);
@@ -307,7 +305,6 @@ pub(super) async fn completions_stream(
         seed,
         top_logprobs: None,
         timeout_at: None,
-        moe_top_k,
         token_tx,
     };
 

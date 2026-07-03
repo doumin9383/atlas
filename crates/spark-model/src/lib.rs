@@ -21,6 +21,7 @@ pub mod engine;
 pub mod factory;
 pub mod forward;
 pub mod layer;
+pub mod moe_top_k;
 pub mod layers;
 pub mod mistral_loader;
 pub mod model;

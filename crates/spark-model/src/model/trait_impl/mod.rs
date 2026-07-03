@@ -299,9 +299,7 @@ impl Model for TransformerModel {
     fn decode_logits_ptr(&self) -> DevicePtr {
         self.decode_logits_ptr_dispatch()
     }
-    fn set_moe_top_k(&self, k: u32) {
         use std::sync::atomic::Ordering;
-        self.moe_top_k.store(k, Ordering::Relaxed);
     }
     fn ep_broadcast_cmd(&self, cmd: u32) -> Result<()> {
         self.ep_broadcast_cmd_dispatch(cmd)

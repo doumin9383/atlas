@@ -154,7 +154,6 @@ pub struct ForwardContext<'a> {
     /// this value instead of `config.num_experts_per_tok`. Must be ≤
     /// `config.num_experts_per_tok` (buffer capacity). Set by the scheduler
     /// before each forward pass.
-    pub moe_top_k: u32,
 }
 
 /// A single transformer layer performing the full per-layer computation.

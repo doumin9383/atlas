@@ -6,8 +6,6 @@ use super::*;
 
 /// K=2 verify: [last_token, draft] → [v0, v1]. Two outcomes: ACCEPT or REJECT.
 pub fn step_verify_k2(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_drafts: usize) {
-    if let Some(k) = a.moe_top_k {
-        model.set_moe_top_k(k);
     }
     let t_sync = Instant::now();
     if let Err(e) = model.sync_secondary() {

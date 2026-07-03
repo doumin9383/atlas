@@ -82,7 +82,6 @@ impl TransformerModel {
             profile: profile_now,
             comm: self.comm_ref(),
             graph_capture: false,
-            moe_top_k: self.moe_top_k.load(std::sync::atomic::Ordering::Relaxed),
         };
 
         // When proc_count == 1 (warm prefix cache hit), use the decode layer path
