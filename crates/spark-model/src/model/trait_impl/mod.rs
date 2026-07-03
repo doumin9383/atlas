@@ -371,8 +371,6 @@ impl Model for TransformerModel {
     fn decode_logits_ptr(&self) -> DevicePtr {
         self.decode_logits_ptr_dispatch()
     }
-        use std::sync::atomic::Ordering;
-    }
     fn ep_broadcast_cmd(&self, cmd: u32) -> Result<()> {
         self.ep_broadcast_cmd_dispatch(cmd)
     }

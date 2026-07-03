@@ -305,10 +305,6 @@ impl InferenceRequest {
         }
     }
 
-    /// MoE expert top-k override. None = use model config default.
-        match self {
-        }
-    }
 }
 
 /// Tokenize stop sequence strings into single-token stop IDs.
