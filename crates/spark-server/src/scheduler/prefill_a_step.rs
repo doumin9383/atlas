@@ -149,7 +149,6 @@ pub fn start_chunked_prefill(
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
-        }
         model.prefill_chunk(
             &prompt_tokens,
             &mut seq,
