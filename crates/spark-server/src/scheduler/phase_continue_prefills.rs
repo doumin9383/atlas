@@ -191,15 +191,8 @@ pub(super) fn continue_in_progress_prefills(
         // Two-phase SSM prefill: when the full sequence hasn't started
         // chunking yet (chunk_offset == 0) and is longer than one chunk,
         // use the two-phase path for better SSM state quality.
-        // Resolve batch MoE top-k for the mixed/prefill forward.
-        let batch_moe_k = active
-            .iter()
-            .min()
-            .unwrap_or(0);
         let use_twophase = p.chunk_offset == 0 && p.prompt_tokens.len() > max_prefill_tokens;
         if use_twophase {
-            if batch_moe_k > 0 {
-            }
             tracing::info!(
                 "Two-phase prefill: {} tokens, chunk_size={}",
                 p.prompt_tokens.len(),

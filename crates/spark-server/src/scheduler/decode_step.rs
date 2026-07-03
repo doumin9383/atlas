@@ -52,10 +52,6 @@ pub fn step_decode_only(
     // empirically as a 51s broadcast timeout on the worker followed by
     // stale comm data reads. See decode_a2.rs for the full rationale.
 
-    // Resolve per-request MoE top-k override (before mutable borrow).
-    if moe_k > 0 {
-    }
-
     let mut refs: Vec<&mut SequenceState> = active.iter_mut().map(|a| &mut a.seq).collect();
 
     let logits = match model.decode_batch(&tokens, &mut refs, 0) {

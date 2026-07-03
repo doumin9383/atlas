@@ -239,7 +239,6 @@ pub fn step_ngram_verify(
     proposer: &mut NgramProposer,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
 ) {
-    }
     let t_sync = Instant::now();
     if let Err(e) = model.sync_secondary() {
         tracing::error!("ngram sync_secondary: {e:#}");
