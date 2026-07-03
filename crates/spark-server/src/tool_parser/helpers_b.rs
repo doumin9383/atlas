@@ -78,7 +78,7 @@ pub(super) fn parse_gemma4_native_call(text: &str) -> Option<ToolCall> {
         .strip_prefix("call:")
         .or_else(|| text.strip_prefix("_call:"))?;
     let brace_pos = rest.find('{')?;
-    let name = rest[..brace_pos].trim().to_string();
+    let name = normalize_tool_name(&rest[..brace_pos]);
     if name.is_empty() {
         return None;
     }
@@ -179,6 +179,23 @@ pub(super) fn append_tool_choice_instruction(prompt: &mut String, tool_choice: &
             ));
         }
         _ => {}
+    }
+}
+
+/// Render the `<tools>` body for a parser's `system_prompt()`.
+///
+/// When TSCG is enabled (MODEL.toml `[behavior].tscg`), returns the
+/// compact function-signature block. Otherwise calls `render_json` —
+/// the parser's existing JSON serialization — so the TSCG-off path is
+/// byte-identical to before this helper existed.
+pub(super) fn tool_list_body(
+    tools: &[ToolDefinition],
+    render_json: impl FnOnce() -> String,
+) -> String {
+    if crate::tscg::tscg_enabled() {
+        crate::tscg::compile_tools(tools)
+    } else {
+        render_json()
     }
 }
 

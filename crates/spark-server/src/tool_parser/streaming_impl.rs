@@ -5,6 +5,17 @@ use super::*;
 
 impl StreamingToolDetector {
     pub fn new() -> Self {
+        Self::new_with_tools(Vec::new())
+    }
+
+    /// Build a detector with the request's tool schemas, enabling per-parameter
+    /// type coercion during live argument streaming. The `ATLAS_BUFFER_TOOL_ARGS`
+    /// env var (set to `1`/`true`) restores the legacy buffer-until-close path.
+    pub fn new_with_tools(tools: Vec<ToolDefinition>) -> Self {
+        let buffer_args = matches!(
+            std::env::var("ATLAS_BUFFER_TOOL_ARGS").as_deref(),
+            Ok("1") | Ok("true")
+        );
         Self {
             buffer: String::new(),
             inside_tag: false,
@@ -13,17 +24,32 @@ impl StreamingToolDetector {
             current_tc_name: None,
             current_tc_id: None,
             current_tc_emitted: 0,
+            tools,
+            buffer_args,
+            args_open: false,
+            emitted_keys: Vec::new(),
+            incremental_emitted: false,
         }
     }
 
     /// Reset the detector state. Called when thinking→content transition occurs
     /// to prevent thinking-era tag fragments from corrupting tool detection.
+    /// Preserves `tools` / `buffer_args` (request-scoped config, not per-call).
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.inside_tag = false;
+        self.reset_call_state();
+    }
+
+    /// Clear the per-tool-call incremental-streaming bookkeeping (called after
+    /// each call closes and on `reset`). Does NOT touch `tools`/`buffer_args`.
+    fn reset_call_state(&mut self) {
         self.current_tc_name = None;
         self.current_tc_id = None;
         self.current_tc_emitted = 0;
+        self.args_open = false;
+        self.emitted_keys.clear();
+        self.incremental_emitted = false;
     }
 
     /// Feed a text delta. Returns events to emit (content or tool calls).
@@ -55,14 +81,32 @@ impl StreamingToolDetector {
                             .map(|p| (p, "</minimax:_call>".len()))
                     });
                 if let Some((end, close_len)) = close_pos {
-                    let inner = self.buffer[..end].to_string();
-                    self.buffer = self.buffer[end + close_len..].to_string();
-                    self.inside_tag = false;
-
                     let idx = self.call_counter as usize;
 
                     if self.current_tc_name.is_some() {
                         // Name was already emitted via ToolCallStart.
+                        // Live path: if we have streamed fragments incrementally
+                        // (`!buffer_args` && `incremental_emitted`), emit only the
+                        // residual (remaining complete params + backfill + closing
+                        // `}` for XML, or the JSON tail). Compute it BEFORE the
+                        // buffer is truncated, since `stream_ready_fragments`
+                        // reads `self.buffer[..end]`.
+                        if !self.buffer_args && self.incremental_emitted {
+                            let frags = self.stream_ready_fragments(end, true);
+                            outputs.extend(frags);
+                            outputs.push(DetectorOutput::ToolCallEnd { idx });
+                            self.call_counter += 1;
+                            self.emitted_tool_calls = true;
+                            self.buffer = self.buffer[end + close_len..].to_string();
+                            self.inside_tag = false;
+                            self.reset_call_state();
+                            continue;
+                        }
+                        let inner = self.buffer[..end].to_string();
+                        self.buffer = self.buffer[end + close_len..].to_string();
+                        self.inside_tag = false;
+                        // Buffered mode OR never-streamed fallback: emit the full
+                        // canonical args once (unchanged legacy behaviour).
                         // Parse the complete inner content to extract JSON arguments.
                         if let Some(tc) = parse_one_call(inner.trim(), self.call_counter) {
                             // Always emit when the parser produced a named call,
@@ -81,7 +125,13 @@ impl StreamingToolDetector {
                         } else {
                             tracing::warn!("Failed to parse tool call body, dropping");
                         }
+                        // Reset incremental state for next tool call.
+                        self.reset_call_state();
+                        continue;
                     } else {
+                        let inner = self.buffer[..end].to_string();
+                        self.buffer = self.buffer[end + close_len..].to_string();
+                        self.inside_tag = false;
                         // Name was never extracted — fall back to complete
                         // ToolCall(s). F75 (2026-04-29): MiniMax envelopes
                         // can contain MULTIPLE `<invoke>` blocks (the
@@ -107,9 +157,7 @@ impl StreamingToolDetector {
                         }
                     }
                     // Reset incremental state for next tool call
-                    self.current_tc_name = None;
-                    self.current_tc_id = None;
-                    self.current_tc_emitted = 0;
+                    self.reset_call_state();
                     continue;
                 }
 
@@ -131,7 +179,15 @@ impl StreamingToolDetector {
                     self.current_tc_name = Some(name);
                     self.current_tc_id = Some(id);
                 }
-                break; // Wait for more tokens (args buffered until </tool_call>)
+                // Live-streaming (default): emit any newly-complete argument
+                // fragments seen so far so the client gets `function.arguments`
+                // incrementally instead of buffered until `</tool_call>`. The
+                // legacy buffer-until-close path runs when `buffer_args` is set.
+                if !self.buffer_args && self.current_tc_name.is_some() {
+                    let frags = self.stream_ready_fragments(self.buffer.len(), false);
+                    outputs.extend(frags);
+                }
+                break; // Wait for more tokens (closing tag not yet seen)
             } else if let Some(mistral_start) = self.buffer.find(MISTRAL_TOOL_CALLS_TAG) {
                 // Mistral native: [TOOL_CALLS]name[ARGS]{json}
                 // No wrapping tag — emit content before the tag, then try to
@@ -288,14 +344,41 @@ impl StreamingToolDetector {
         // one or dispatches the wrong one with empty args. Mirror the
         // in-stream close path: emit ToolCallDelta + ToolCallEnd against
         // the already-streamed header, not a full ToolCall.
-        if was_inside_tag && let Some(tc) = parse_one_call(text.trim(), self.call_counter) {
+        // #192 containment (parity with `parse_tool_calls`): this buffer has NO
+        // `</tool_call>` close, so an unterminated trailing `<parameter=…>`
+        // value is unbounded — cut at the last complete `</parameter>` (else
+        // drop the param section) before salvaging, so drifted tail garbage
+        // is never swallowed into an argument string.
+        if was_inside_tag
+            && let Some(tc) = parse_one_call(
+                contain_unterminated_call_tail(text.trim()),
+                self.call_counter,
+            )
+        {
             let idx = self.call_counter as usize;
-            self.call_counter += 1;
-            self.emitted_tool_calls = true;
             if self.current_tc_name.is_some() {
-                self.current_tc_name = None;
-                self.current_tc_id = None;
-                self.current_tc_emitted = 0;
+                // Live path: if we already streamed fragments, emit only the
+                // residual (remaining complete params + backfill + closing `}`,
+                // or the JSON tail) instead of the full args. `flush()` already
+                // took the buffer, so restore it for `stream_ready_fragments` to
+                // scan, then clear it again. IMPORTANT: call_counter is bumped
+                // AFTER `stream_ready_fragments` — it reads `self.call_counter`
+                // for the fragment `idx`, so bumping first would emit the
+                // closing `}` under the wrong index (handler drops it).
+                if !self.buffer_args && self.incremental_emitted {
+                    self.buffer = text;
+                    let limit = self.buffer.len();
+                    let mut out = self.stream_ready_fragments(limit, true);
+                    out.push(DetectorOutput::ToolCallEnd { idx });
+                    self.call_counter += 1;
+                    self.emitted_tool_calls = true;
+                    self.buffer.clear();
+                    self.reset_call_state();
+                    return out;
+                }
+                self.call_counter += 1;
+                self.emitted_tool_calls = true;
+                self.reset_call_state();
                 return vec![
                     DetectorOutput::ToolCallDelta {
                         args: tc.function.arguments,
@@ -304,6 +387,8 @@ impl StreamingToolDetector {
                     DetectorOutput::ToolCallEnd { idx },
                 ];
             }
+            self.call_counter += 1;
+            self.emitted_tool_calls = true;
             return vec![DetectorOutput::ToolCall(tc, idx)];
         }
 
@@ -361,6 +446,18 @@ impl StreamingToolDetector {
 
     pub fn has_tool_calls(&self) -> bool {
         self.call_counter > 0
+    }
+
+    /// True while the detector is between a `<tool_call>` opener and its
+    /// matching close — i.e. accumulating a tool-call body. Callers use this
+    /// to suppress content-level scrubbing (e.g. the bare role-literal strip
+    /// in `handle_token`) that would otherwise eat a legitimate name/argument
+    /// fragment. A standalone `tool` BPE token inside the body is the leading
+    /// fragment of a `tool_*`-prefixed NAME (`tool_search`, `tool_call`,
+    /// `tool_describe`) being reassembled across token boundaries — dropping
+    /// it truncates the streamed name by exactly `len("tool")` == 4 chars.
+    pub fn inside_tool_call(&self) -> bool {
+        self.inside_tag
     }
 
     /// Returns safe byte length to emit without splitting a partial tag.

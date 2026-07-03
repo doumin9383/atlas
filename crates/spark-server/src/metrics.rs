@@ -40,22 +40,6 @@ lazy_static! {
             &["verdict", "channel", "spinning"]
         ).unwrap();
 
-    // ── Server-side intervention telemetry (P5.2) ──
-    //
-    // Track how often the goal-pin reminder + observation-masking
-    // fire, so we can correlate intervention frequency with outcome
-    // metrics (TTFT, completion length, finish_reason).
-    pub static ref TASK_PIN_INJECTIONS: IntCounter =
-        register_int_counter!(
-            "atlas_task_pin_injections_total",
-            "Times the verbatim-goal reminder was injected into a request"
-        ).unwrap();
-    pub static ref OBSERVATION_MASK_ELIDED_BODIES: IntCounter =
-        register_int_counter!(
-            "atlas_observation_mask_elided_bodies_total",
-            "Stale tool-failure bodies replaced with one-line summaries"
-        ).unwrap();
-
     // ── Anthropic translation-drift counter (P5.1) ──
     //
     // Increments whenever the Anthropic→OpenAI translator produces a
@@ -81,5 +65,18 @@ lazy_static! {
             "atlas_spec_decode_verify_total",
             "MTP draft verify outcomes by K and result",
             &["k", "outcome"]
+        ).unwrap();
+
+    // ── Tool-call telemetry ──
+    //
+    // Total successful tool calls emitted by the API layer (sum across
+    // streaming + blocking). Paired with the "Tool call: name(args)"
+    // info log so operators can both grep logs and graph rates.
+    // Unlabeled (no `name` label) — high-cardinality tool names would
+    // blow up Prometheus cardinality.
+    pub static ref TOOL_CALLS_TOTAL: IntCounter =
+        register_int_counter!(
+            "atlas_tool_calls_total",
+            "Total successful tool calls emitted by the server"
         ).unwrap();
 }

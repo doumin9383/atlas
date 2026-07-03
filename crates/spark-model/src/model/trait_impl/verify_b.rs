@@ -45,18 +45,17 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
+        let fp32 = 2usize;
         let k = 2usize;
 
-        // F62 (2026-04-27): SpecMamba dual-buffer pre-verify copy.
-        // Copy canonical SSM state (h_state_checkpoint) → scratch (h_state)
-        // BEFORE the kernel runs. The kernel mutates the scratch; the
-        // canonical is preserved across verify until commit.
-        self.pre_verify_copy_async(seq)?;
+        // Item #2 (STree-style in-place K=2 verify): `h_state` IS canonical
+        // — the verify kernel reads/writes it directly and the commit
+        // (`commit_accepted_prefix`) rewinds it in place on reject. There is
+        // no scratch/canonical split to seed, so the legacy SpecMamba
+        // dual-buffer pre-verify copy (~60 MB h_state + conv D2D per K=2
+        // step) is gone. The CUDA-graph capture below is unaffected: the
+        // captured nodes take the same `h_state` pointer, which never moves.
+        // (K=3/K=4/DFlash verify still run pre_verify_copy_async.)
 
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
@@ -98,7 +97,17 @@ impl TransformerModel {
             let pos = seq.seq_len + t;
             let block_idx = pos / bs;
             let block_offset = pos % bs;
-            let physical_block = seq.physical_block_for(block_idx).unwrap_or(0);
+            // Fall back to the dummy scratch block, NOT block 0: physical
+            // block 0 is a live (likely shared prefix-cache) block, and a
+            // silent write there corrupts cached KV for every reader.
+            let physical_block = seq.physical_block_for(block_idx).unwrap_or_else(|| {
+                tracing::error!(
+                    "verify_k2: no physical block for pos {pos} (block_table len {}); \
+                     writing KV to dummy block",
+                    seq.block_table.len(),
+                );
+                self.dummy_kv_block
+            });
             slots[t] = (physical_block as i64) * (bs as i64) + (block_offset as i64);
         }
         let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, 16) };
@@ -171,6 +180,15 @@ impl TransformerModel {
             // illegal under CUDA graph capture.
             && !hss_engaged;
 
+        // DeepSeek-V4 hash-MoE (first `num_hash_layers`) routes experts by token
+        // id via the static tid2eid table, so the verify forward needs the 2
+        // verify tokens in the stable `token_ids` device buffer. Uploaded
+        // pre-graph (host→device is illegal under CUDA-graph capture); the graph
+        // then reads the stable device buffer. Mirrors `decode()`'s token_ids.
+        let tid_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.gpu
+            .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
+
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
@@ -179,6 +197,8 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            gdn_exact_replay: false,
+            token_ids: Some(self.buffers.token_ids()),
         };
 
         // ── Phase 2: CUDA graph capture / replay ──
@@ -214,24 +234,55 @@ impl TransformerModel {
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
-                    // Attention: treat 2 tokens as 2 virtual sequences via
-                    // decode_multi_seq. EmptyLayerState has no actual state.
-                    let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
-                        .map(|_| layer.alloc_state(self.gpu.as_ref()))
-                        .collect::<Result<_>>()?;
-                    let mut refs: Vec<&mut (dyn LayerState + 'static)> =
-                        dummy_states.iter_mut().map(|s| s.as_mut()).collect();
-                    layer.decode_multi_seq(
-                        hidden,
-                        residual,
-                        k,
-                        &mut refs,
-                        &mut kv_cache,
-                        &seq_lens_vec,
-                        &block_tables_vec,
-                        &ctx,
-                        stream,
-                    )?;
+                    if hss_engaged {
+                        // HSS path: `decode_multi_seq` calls the production
+                        // paged-decode kernel which reads K/V from HBM only
+                        // (`meta.block_table`). Under HSS, HBM is capped to
+                        // `cache_blocks_per_seq` blocks, so older context
+                        // lives only on disk and is unreachable from the
+                        // multi-Q kernel — Q/V attends only over the recent
+                        // ~cap×bs tokens, missing the long-context history.
+                        // The single-token `decode` path routes through the
+                        // HSS orchestrator (`attend_layer_on_stream`) which
+                        // reads the full history from disk. Fall back to
+                        // `decode_batched` (N sequential single-token
+                        // decodes via the orchestrator) at the cost of
+                        // ~k× attention launches per verify step. Mirrors
+                        // the SSM branch below which already uses
+                        // decode_batched for the same correctness reason.
+                        layer.decode_batched(
+                            hidden,
+                            residual,
+                            k,
+                            seq.layer_states[layer_idx].as_mut(),
+                            &mut kv_cache,
+                            seq.seq_len,
+                            &mut seq.block_table,
+                            &mut seq.disk_block_ids,
+                            &mut seq.disk_last_offloaded_per_layer,
+                            &ctx,
+                            stream,
+                        )?;
+                    } else {
+                        // Attention: treat 2 tokens as 2 virtual sequences via
+                        // decode_multi_seq. EmptyLayerState has no actual state.
+                        let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
+                            .map(|_| layer.alloc_state(self.gpu.as_ref()))
+                            .collect::<Result<_>>()?;
+                        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
+                            dummy_states.iter_mut().map(|s| s.as_mut()).collect();
+                        layer.decode_multi_seq(
+                            hidden,
+                            residual,
+                            k,
+                            &mut refs,
+                            &mut kv_cache,
+                            &seq_lens_vec,
+                            &block_tables_vec,
+                            &ctx,
+                            stream,
+                        )?;
+                    }
                 } else {
                     // SSM: process K=2 tokens for one sequence via decode_batched.
                     layer.decode_batched(

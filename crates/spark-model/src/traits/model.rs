@@ -34,7 +34,7 @@
 use anyhow::{Result, bail};
 use spark_runtime::gpu::DevicePtr;
 
-use super::{MixedForwardResult, SequenceState};
+use super::{MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState};
 
 pub trait Model: Send + Sync {
     /// Run prefill: process all prompt tokens through the model.
@@ -102,6 +102,78 @@ pub trait Model: Send + Sync {
             stream,
         )?;
         Ok(MixedForwardResult {
+            decode_logits,
+            prefill_logits,
+        })
+    }
+
+    /// Process N concurrent prefill chunks in one forward pass (same weight
+    /// load amortised across N streams). The default implementation falls
+    /// back to a per-stream loop calling `prefill_chunk` — implementors that
+    /// support kernel-level batched prefill should override this.
+    ///
+    /// Returns a `Vec<DevicePtr>` parallel to `streams`: each entry is the
+    /// last-token logits pointer for that stream when its chunk is
+    /// `is_last_chunk`, or `DevicePtr::NULL` otherwise.
+    ///
+    /// Tracks issue Q12 in
+    /// `/workspace/atlas-internal/qwen-refactor/notes.md`.
+    fn prefill_batch_chunk(
+        &self,
+        streams: &mut [PrefillSlice<'_>],
+        stream: u64,
+    ) -> Result<Vec<DevicePtr>> {
+        // Default: serialized per-stream prefill_chunk. This preserves
+        // current behavior for any model that doesn't override; only the
+        // weight-streaming amortisation is lost vs a true batched path.
+        let mut out = Vec::with_capacity(streams.len());
+        for slice in streams.iter_mut() {
+            let logits = self.prefill_chunk(
+                slice.prompt_tokens,
+                slice.seq,
+                slice.chunk_start,
+                slice.chunk_len,
+                slice.is_last_chunk,
+                stream,
+            )?;
+            out.push(logits);
+        }
+        Ok(out)
+    }
+
+    /// Generalised mixed forward: M decode tokens + N concurrent prefill
+    /// chunks fused into one forward pass. Default: delegates to
+    /// `decode_batch` + `prefill_batch_chunk` serially. Models that
+    /// implement true mixed batching should override.
+    fn mixed_forward_batch(
+        &self,
+        decode_tokens: &[u32],
+        decode_seqs: &mut [&mut SequenceState],
+        prefill_streams: &mut [PrefillSlice<'_>],
+        stream: u64,
+    ) -> Result<MixedBatchResult> {
+        // Default: serial execution.
+        let decode_logits = if !decode_tokens.is_empty() {
+            let lg = self.decode_batch(decode_tokens, decode_seqs, stream)?;
+            // #110: decode_batch runs its whole forward on the DEFAULT stream
+            // — both `decode_batch_compute_main` (n>=2) and the n==1 graph path
+            // ignore the `stream` arg and hardcode `gpu.default_stream()`. The
+            // batched prefill below reuses the SAME shared arena buffers
+            // (hidden_states/residual/scratch/gdn) but submits on `stream`
+            // (prefill_stream). With no barrier the two sub-passes execute
+            // concurrently on two different streams and race over those
+            // buffers — corrupting the batched prefill's slot table into wild
+            // KV-cache indices and faulting with a CUDA illegal access
+            // (status 700). Synchronize the decode stream so its buffer use is
+            // fully retired before prefill overwrites them. This runs once per
+            // mixed step (active+prefilling), never in the hot decode loop.
+            self.synchronize(self.default_stream())?;
+            lg
+        } else {
+            spark_runtime::gpu::DevicePtr::NULL
+        };
+        let prefill_logits = self.prefill_batch_chunk(prefill_streams, stream)?;
+        Ok(MixedBatchResult {
             decode_logits,
             prefill_logits,
         })
@@ -190,6 +262,56 @@ pub trait Model: Send + Sync {
     /// Rollback SSM states after partial acceptance.
     fn rollback_ssm_states(&self, seq: &mut SequenceState, num_accepted: usize) -> Result<()>;
 
+    /// True when this model has recurrent SSM / Mamba layers whose
+    /// `h_state` + `conv_state` are advanced in-place every decoded
+    /// token.
+    ///
+    /// Pure-attention models return `false` (the default): their only
+    /// per-token state is the paged KV cache, which the Phase-C
+    /// boundary rollback rewinds by lowering `seq_len`. Hybrid models
+    /// (Qwen3.6-A3B, MiniMax, Nemotron-nano) return `true` — for those
+    /// the scheduler MUST also restore the SSM state from a decode-time
+    /// snapshot, because the recurrent state cannot be undone by
+    /// lowering a cursor.
+    fn has_ssm_layers(&self) -> bool {
+        false
+    }
+
+    /// Number of decode-rollback SSM snapshot slots reserved **per
+    /// active sequence** (Phase-C). The scheduler's per-sequence
+    /// snapshot ring is sized from this. `0` (the default) means the
+    /// model keeps no decode-rollback snapshots — appropriate for
+    /// pure-attention models and for SSM models when the snapshot pool
+    /// has no capacity reserved. SSM models with a populated pool
+    /// override to `ROLLBACK_RESTEER_CAP + 1`.
+    fn decode_rollback_ring_slots(&self) -> usize {
+        0
+    }
+
+    /// Save `seq`'s live SSM `h_state` + `conv_state` (all SSM layers)
+    /// into the decode-rollback snapshot slot `ring_slot`.
+    ///
+    /// `ring_slot` is a per-sequence ring index in
+    /// `[0, decode_rollback_ring_slots())`; the model maps it to a
+    /// concrete snapshot-pool slot keyed by `seq.slot_idx`. Reuses the
+    /// same `SsmSnapshotPool` D2D copy primitive as Marconi prefix
+    /// caching and MTP verify (SSOT — one snapshot mechanism).
+    ///
+    /// Default: no-op `Ok(())` for pure-attention models, which have no
+    /// SSM state to snapshot.
+    fn save_decode_ssm_snapshot(&self, _seq: &SequenceState, _ring_slot: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Restore `seq`'s SSM `h_state` + `conv_state` (all SSM layers)
+    /// from the decode-rollback snapshot slot `ring_slot` previously
+    /// written by [`Self::save_decode_ssm_snapshot`].
+    ///
+    /// Default: no-op `Ok(())` for pure-attention models.
+    fn restore_decode_ssm_snapshot(&self, _seq: &SequenceState, _ring_slot: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Speculative decoding via the model's internal MTP proposer; falls
     /// back to regular decode when no proposer is wired up.
     fn generate_speculative(
@@ -214,6 +336,15 @@ pub trait Model: Send + Sync {
     /// valid). Benefits multi-turn agentic sessions that resend full history.
     fn cache_sequence(&self, seq: &SequenceState);
 
+    /// #155 iter3: during decode, save a block-aligned Marconi SSM snapshot
+    /// at checkpoint-interval boundaries so the NEXT turn's warm prefix-cache
+    /// hit restores from decode-produced state near the conversation's end —
+    /// instead of replaying decode-produced tokens through the prefill kernel
+    /// (the warm-hit drift ratchet, issue #155). Called from the scheduler
+    /// after each decode step's live SSM state is canonical (post-commit on
+    /// the MTP path). Default no-op (non-hybrid models / caching disabled).
+    fn decode_marconi_checkpoint(&self, _seq: &mut SequenceState) {}
+
     /// Free all GPU resources associated with a sequence.
     ///
     /// Releases KV cache blocks and returns SSM state pool slot.
@@ -226,6 +357,17 @@ pub trait Model: Send + Sync {
     /// slot to `new_slot`. Used by the scheduler for slot compaction after
     /// swap_remove to keep active sequences at contiguous slots [0..N).
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()>;
+
+    /// Disown a retired sequence's SSM pool slot after `compact_sequence`
+    /// migrated it to a surviving sequence.
+    ///
+    /// Sets the `slot_idx` reuse sentinel AND neutralizes the sequence's
+    /// internal slot-release guard so the migrated slot is NOT released when
+    /// this sequence is later freed or dropped (the surviving sequence now owns
+    /// it). The scheduler MUST call this — instead of mutating `slot_idx`
+    /// directly — immediately after a `compact_sequence` that reuses this
+    /// sequence's slot, so a subsequent early-return/drop cannot double-release.
+    fn detach_slot_for_reuse(&self, seq: &mut SequenceState);
 
     /// CUDA-graphed K=2 verify: 2 tokens, capture-then-replay. Returns
     /// `[verified_0, verified_1]` argmax IDs. SSM intermediates saved for
@@ -336,11 +478,16 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
-    /// EP worker step: receive a command from rank 0 and execute it.
+    /// EP worker step: receive a (seq_id, cmd) preamble from rank 0 and
+    /// execute the command in the addressed slot.
     ///
     /// Returns false when the worker should shut down.
     /// Only valid on rank > 0 with EP enabled.
-    fn ep_worker_step(&self, _seq: &mut SequenceState) -> Result<bool> {
+    ///
+    /// `slots` must be sized to `args.max_batch_size` (same as the head's
+    /// scheduler `active` capacity); commands with `seq_id >= slots.len()`
+    /// fail loudly rather than corrupt unrelated state.
+    fn ep_worker_step(&self, _slots: &mut [Option<SequenceState>]) -> Result<bool> {
         Ok(true) // no-op for non-EP models
     }
 
@@ -397,6 +544,28 @@ pub trait Model: Send + Sync {
         Ok(()) // no-op for non-EP models
     }
 
+    /// EP broadcast: send a `(seq_id, cmd)` pair to all worker ranks.
+    ///
+    /// Use this at the *first* broadcast of a logical command sequence
+    /// (e.g. the K=2 verify marker, prefill start, decode token, etc.).
+    /// Follow-up broadcasts within the same command (chunk metadata, more
+    /// tokens, accept/reject result) keep using [`Self::ep_broadcast_cmd`]
+    /// — the worker consumes the preamble once per command and routes
+    /// subsequent reads through the slot it identified.
+    ///
+    /// When [`Self::ep_protocol_v2`] returns false (the default), the
+    /// `seq_id` is ignored on the wire and behaviour matches the legacy
+    /// single-sequence broadcast.
+    fn ep_broadcast_cmd_for_seq(&self, _seq_id: u32, _cmd: u32) -> Result<()> {
+        Ok(()) // no-op for non-EP models
+    }
+
+    /// Returns true if this model's EP comm path is using the v2 protocol
+    /// (slot-aware seq_id preamble). Default false — pre-PR behaviour.
+    fn ep_protocol_v2(&self) -> bool {
+        false
+    }
+
     /// EP bulk broadcast: send an array of u32 tokens to all worker ranks.
     /// Uses a single NCCL broadcast instead of per-token broadcasts.
     fn ep_broadcast_tokens(&self, _tokens: &[u32]) -> Result<Vec<u32>> {
@@ -447,6 +616,22 @@ pub trait Model: Send + Sync {
     /// default_stream (FIFO ordering with the next kernel). No-op default
     /// for non-MTP backends.
     fn pre_verify_copy_async(&self, _seq: &mut SequenceState) -> Result<()> {
+        Ok(())
+    }
+
+    /// Item #2 (STree-style in-place verify commit): commit the surviving
+    /// prefix of a verify pass directly onto the canonical `h_state` /
+    /// `conv_state`. Full accept (`num_accepted == k`) is a no-op (the
+    /// kernel's final state is already live); partial accept is a single
+    /// index-select of `h_state_intermediates[num_accepted-1]`. No-op
+    /// default for backends without the dual-buffer SSM state.
+    /// Runs on `secondary_stream`; pair with `sync_secondary`.
+    fn commit_accepted_prefix(
+        &self,
+        _seq: &mut SequenceState,
+        _num_accepted: usize,
+        _k: usize,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -529,6 +714,14 @@ pub trait Model: Send + Sync {
 
     /// Make a stream wait for an event (GPU-side sync, CPU does not block).
     fn stream_wait_event(&self, _stream: u64, _event: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Block the host until all work submitted to `stream` has completed.
+    /// Used by `mixed_forward_batch` to retire the decode pass (which runs on
+    /// the default stream) before the batched prefill reuses the shared arena
+    /// buffers on another stream (#110). Default no-op for non-CUDA mocks.
+    fn synchronize(&self, _stream: u64) -> Result<()> {
         Ok(())
     }
 }

@@ -42,16 +42,38 @@ impl MoeLayer {
             _ => anyhow::bail!("FP8 expert pointer tables not set"),
         };
 
-        // ── Shared expert (same as NVFP4 path) ──
+        // ── Shared expert ──
+        // ATLAS_FP8_W8A8 path: per-token FP8 quant on activations +
+        // fp8_gemm_t_blockscaled with both scales in the FP32 epilogue.
+        // The shared expert is dense (every token), so we reuse the same
+        // dense W8A8 GEMM that attention QKV/O proj already use.
+        let force_w8a8_sh = matches!(std::env::var("ATLAS_FP8_W8A8").ok().as_deref(), Some("1"))
+            && self.fp8_gemm_t_blockscaled_k.0 != 0
+            && self.per_token_group_quant_fp8_k.0 != 0;
         let has_shared = shared_inter > 0;
-        if has_shared {
+        if has_shared && force_w8a8_sh {
             let shared_gate_out = ctx.buffers.ssm_deinterleaved();
             let shared_up_out = ctx.buffers.ssm_qkvz();
-            // FP8 GEMM for shared expert (M=num_tokens, single kernel each)
-            ops::w8a16_gemm(
+            let m_us: usize = n as usize;
+            let a_fp8_bytes: usize = m_us * h as usize;
+            let a_scale_bytes: usize = m_us * (h as usize / 128) * 4;
+            let input_fp8 = ctx.gpu.alloc(a_fp8_bytes)?;
+            let input_scale = ctx.gpu.alloc(a_scale_bytes)?;
+            ops::per_token_group_quant_fp8(
                 ctx.gpu,
-                self.w8a16_gemm_k,
+                self.per_token_group_quant_fp8_k,
                 input,
+                input_fp8,
+                input_scale,
+                n,
+                h,
+                stream,
+            )?;
+            ops::fp8_gemm_t_blockscaled(
+                ctx.gpu,
+                self.fp8_gemm_t_blockscaled_k,
+                input_fp8,
+                input_scale,
                 sh.gate_proj.weight,
                 sh.gate_proj.row_scale,
                 shared_gate_out,
@@ -60,10 +82,11 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
-            ops::w8a16_gemm(
+            ops::fp8_gemm_t_blockscaled(
                 ctx.gpu,
-                self.w8a16_gemm_k,
-                input,
+                self.fp8_gemm_t_blockscaled_k,
+                input_fp8,
+                input_scale,
                 sh.up_proj.weight,
                 sh.up_proj.row_scale,
                 shared_up_out,
@@ -71,6 +94,109 @@ impl MoeLayer {
                 shared_inter,
                 h,
                 stream,
+            )?;
+            ctx.gpu.synchronize(stream)?;
+            ctx.gpu.free(input_fp8)?;
+            ctx.gpu.free(input_scale)?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.moe_act_mul,
+                shared_gate_out,
+                shared_up_out,
+                shared_gate_out,
+                n * shared_inter,
+                stream,
+            )?;
+            let shared_down_out = ctx.buffers.attn_output();
+            // Quant the post-silu intermediate (K=shared_inter)
+            let a2_bytes: usize = m_us * shared_inter as usize;
+            let a2_scale_bytes: usize = m_us * (shared_inter as usize / 128) * 4;
+            let down_in_fp8 = ctx.gpu.alloc(a2_bytes)?;
+            let down_in_scale = ctx.gpu.alloc(a2_scale_bytes)?;
+            ops::per_token_group_quant_fp8(
+                ctx.gpu,
+                self.per_token_group_quant_fp8_k,
+                shared_gate_out,
+                down_in_fp8,
+                down_in_scale,
+                n,
+                shared_inter,
+                stream,
+            )?;
+            ops::fp8_gemm_t_blockscaled(
+                ctx.gpu,
+                self.fp8_gemm_t_blockscaled_k,
+                down_in_fp8,
+                down_in_scale,
+                sh.down_proj.weight,
+                sh.down_proj.row_scale,
+                shared_down_out,
+                n,
+                h,
+                shared_inter,
+                stream,
+            )?;
+            ctx.gpu.synchronize(stream)?;
+            ctx.gpu.free(down_in_fp8)?;
+            ctx.gpu.free(down_in_scale)?;
+        } else if has_shared {
+            let shared_gate_out = ctx.buffers.ssm_deinterleaved();
+            let shared_up_out = ctx.buffers.ssm_qkvz();
+            // Shared-expert dense GEMMs (gate/up/down, every token). The
+            // bit-identical (cosine=1.0) ~4.6× faster pipelined kernel is the
+            // default; on targets that do not ship it (native-HIP/gfx1151 — the
+            // pipelined `w8a16_gemm` is not ported, so the handle is null) fall
+            // back to the byte-exact non-pipelined `w8a16_gemm`. Same args, same
+            // numerics — without this the routed FP8 grouped prefill path would
+            // launch a null kernel handle (hipErrorInvalidHandle).
+            let use_pipelined = self.w8a16_gemm_pipelined_k.0 != 0;
+            let sh_gemm = |inp, w, sc, outp, mm, nn, kk| -> anyhow::Result<()> {
+                if use_pipelined {
+                    ops::w8a16_gemm_pipelined(
+                        ctx.gpu,
+                        self.w8a16_gemm_pipelined_k,
+                        inp,
+                        w,
+                        sc,
+                        outp,
+                        mm,
+                        nn,
+                        kk,
+                        stream,
+                    )
+                } else {
+                    ops::w8a16_gemm(
+                        ctx.gpu,
+                        self.w8a16_gemm_k,
+                        inp,
+                        w,
+                        sc,
+                        outp,
+                        mm,
+                        nn,
+                        kk,
+                        stream,
+                    )
+                }
+            };
+            // FP8 GEMM for shared expert (M=num_tokens, single kernel each)
+            sh_gemm(
+                input,
+                sh.gate_proj.weight,
+                sh.gate_proj.row_scale,
+                shared_gate_out,
+                n,
+                shared_inter,
+                h,
+            )?;
+            sh_gemm(
+                input,
+                sh.up_proj.weight,
+                sh.up_proj.row_scale,
+                shared_up_out,
+                n,
+                shared_inter,
+                h,
             )?;
             // Activation + down for shared expert (SiLU or GeGLU)
             ops::silu_mul(
@@ -83,9 +209,7 @@ impl MoeLayer {
                 stream,
             )?;
             let shared_down_out = ctx.buffers.attn_output();
-            ops::w8a16_gemm(
-                ctx.gpu,
-                self.w8a16_gemm_k,
+            sh_gemm(
                 shared_gate_out,
                 sh.down_proj.weight,
                 sh.down_proj.row_scale,
@@ -93,7 +217,6 @@ impl MoeLayer {
                 n,
                 h,
                 shared_inter,
-                stream,
             )?;
         }
 
@@ -101,6 +224,7 @@ impl MoeLayer {
 
         // Gemma-4 router pre-norm (no-op for other models).
         let router_in = self.router_input(input, n, h, ctx, stream)?;
+        super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
         // 1. Gate GEMM
         let gate_logits = ctx.buffers.gate_logits();
         if let Some(ref nvfp4) = self.gate_nvfp4 {
@@ -129,6 +253,8 @@ impl MoeLayer {
             )?;
         }
 
+        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+
         // 2. Batched topK dispatch (sigmoid+bias for MiniMax/DeepSeek-V3,
         //    softmax for everyone else — selection by `correction_bias_dev`).
         let scratch = ctx.buffers.scratch();
@@ -145,7 +271,7 @@ impl MoeLayer {
                 num_experts,
                 top_k,
                 ctx.config.norm_topk_prob,
-                1.0,
+                ctx.config.routed_scaling_factor as f32,
                 n,
                 stream,
             )?;
@@ -163,6 +289,8 @@ impl MoeLayer {
                 stream,
             )?;
         }
+
+        super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, n, top_k)?;
 
         // 3. Sort tokens by expert
         let te = total_expanded as usize;
@@ -184,19 +312,48 @@ impl MoeLayer {
             stream,
         )?;
 
-        // 4. Max M tiles (same heuristic as NVFP4)
+        // 4. Max M tiles — sized for worst-case expert skew, not 2× avg.
+        // The `(avg * 2)` heuristic silently truncated heavy experts:
+        // observed avg=129, max=929 tokens for one expert (= 7× avg) in
+        // a 4097-token chunk, dropping 609 rows for that expert and
+        // under-counting routed-MoE output systematically (-14% at L0).
+        // Now bumped to `(num_tokens * top_k).div_ceil(64)` which always
+        // covers the absolute worst case (1 expert eats all tokens).
+        // Cost: extra threadblocks for empty tiles (early-exit on
+        // `m_idx >= M_expert`), low overhead vs the previous correctness
+        // bug.
         let avg_per_expert = (num_tokens * top_k as usize).div_ceil(ne);
-        let max_m_tiles = (avg_per_expert * 2).div_ceil(64).max(1) as u32;
+        let max_m_tiles = (num_tokens * top_k as usize).div_ceil(64).max(1) as u32;
+        super::dump::dump_expert_load(
+            ctx.gpu,
+            stream,
+            expert_offsets,
+            ne,
+            num_tokens,
+            avg_per_expert,
+            max_m_tiles,
+        );
 
         // 5. FP8 grouped gate+up GEMM
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
-        // EP: zero expert buffers for remote experts
-        if ctx.comm.is_some() {
-            let gate_bytes = te * inter as usize * 2;
-            ctx.gpu
-                .memset_async(expert_gate_out, 0, gate_bytes, stream)?;
-            ctx.gpu.memset_async(expert_up_out, 0, gate_bytes, stream)?;
+        // PM4_N_TILE / PM4_M_TILE — SSOT mirror of the kernel #defines. The
+        // builder packs (m_tile<<6)|n_tile, so n_tiles uses PM4_N_TILE=64 and
+        // the m granularity is PM4_M_TILE=128.
+        const PM4_N_TILE: u32 = 64;
+        const PM4_M_TILE: u32 = 128;
+        // 2026-05-20: zero expert buffers unconditionally before the grouped
+        // GEMMs. Even with worst-case `max_m_tiles` (which sizes the grid
+        // for one-expert-eats-all), the kernel only writes rows where
+        // `m_idx < M_expert` per expert — rows past the expert's actual
+        // count keep stale data from the previous prefill (or uninit memory
+        // on first prefill) and contaminate unpermute_reduce. Previously
+        // guarded behind `ctx.comm.is_some()` (EP-only), making single-GPU
+        // non-deterministic.
+        {
+            let gu_bytes = te * inter as usize * 2;
+            ctx.gpu.memset_async(expert_gate_out, 0, gu_bytes, stream)?;
+            ctx.gpu.memset_async(expert_up_out, 0, gu_bytes, stream)?;
             ctx.gpu.memset_async(
                 ctx.buffers.expert_down_out(),
                 0,
@@ -204,12 +361,35 @@ impl MoeLayer {
                 stream,
             )?;
         }
-        let fp8_grouped_k = self.fp8_grouped_kernel();
-        if max_m_tiles > 0 {
-            ops::moe_fp8_grouped_gemm(
+        // ATLAS_FP8_W8A8: pre-quant input/intermediate to FP8 with per-token-
+        // per-128 FP32 scale, use new W8A8 grouped GEMM (vLLM-equivalent).
+        let force_w8a8 = matches!(std::env::var("ATLAS_FP8_W8A8").ok().as_deref(), Some("1"))
+            && self.moe_w8a8_grouped_gemm_k.0 != 0
+            && self.per_token_group_quant_fp8_k.0 != 0;
+
+        if force_w8a8 && max_m_tiles > 0 {
+            // Quant input [num_tokens, h] → input_fp8 + input_a_scale ONCE,
+            // reuse for both gate and up.
+            let m = num_tokens;
+            let a_fp8_bytes = m * h as usize;
+            let a_scale_bytes = m * (h as usize / 128) * 4;
+            let input_fp8 = ctx.gpu.alloc(a_fp8_bytes)?;
+            let input_a_scale = ctx.gpu.alloc(a_scale_bytes)?;
+            ops::per_token_group_quant_fp8(
                 ctx.gpu,
-                fp8_grouped_k,
+                self.per_token_group_quant_fp8_k,
                 input,
+                input_fp8,
+                input_a_scale,
+                m as u32,
+                h,
+                stream,
+            )?;
+            ops::moe_w8a8_grouped_gemm(
+                ctx.gpu,
+                self.moe_w8a8_grouped_gemm_k,
+                input_fp8,
+                input_a_scale,
                 gp.weight_ptrs,
                 gp.scale_ptrs,
                 expert_gate_out,
@@ -221,11 +401,11 @@ impl MoeLayer {
                 max_m_tiles,
                 stream,
             )?;
-
-            ops::moe_fp8_grouped_gemm(
+            ops::moe_w8a8_grouped_gemm(
                 ctx.gpu,
-                fp8_grouped_k,
-                input,
+                self.moe_w8a8_grouped_gemm_k,
+                input_fp8,
+                input_a_scale,
                 up.weight_ptrs,
                 up.scale_ptrs,
                 expert_up_out,
@@ -237,11 +417,78 @@ impl MoeLayer {
                 max_m_tiles,
                 stream,
             )?;
+            ctx.gpu.synchronize(stream)?;
+            ctx.gpu.free(input_fp8)?;
+            ctx.gpu.free(input_a_scale)?;
+        } else if max_m_tiles > 0 {
+            // Routed-expert FP8 grouped gate+up GEMM via grid-compaction. Build
+            // the work-list ONCE (gate and up share the same expert_offsets,
+            // weight-pointer NULL-ness, N=inter, K=h tiling), reuse it for both
+            // GEMMs, free after. Builder + both grouped-GEMM launches are on the
+            // SAME `stream` (read-after-write of total_tiles/worklist — see the
+            // moe_build_tile_worklist comment).
+            let n_tiles_gu = inter.div_ceil(PM4_N_TILE);
+            // Worst-case work-items: one expert can eat all te tokens
+            // (te.div_ceil(128) m-tiles) plus a +ne+1 slack term covering
+            // per-expert m-tile rounding when tokens are spread across all
+            // experts. ×n_tiles n-tiles, ×2 words/item, ×4 bytes/word.
+            let wl_cap_items = (te.div_ceil(PM4_M_TILE as usize) + ne + 1) * n_tiles_gu as usize;
+            let wl_gu = ctx.gpu.alloc(wl_cap_items * 2 * 4)?;
+            let tt_gu = ctx.gpu.alloc(4)?;
+            ops::moe_build_tile_worklist(
+                ctx.gpu,
+                self.moe_build_tile_worklist_k,
+                expert_offsets,
+                gp.weight_ptrs,
+                wl_gu,
+                tt_gu,
+                num_experts,
+                n_tiles_gu,
+                PM4_M_TILE,
+                stream,
+            )?;
+            ops::moe_fp8_grouped_gemm(
+                ctx.gpu,
+                self.moe_fp8_grouped_gemm_k,
+                input,
+                gp.weight_ptrs,
+                gp.scale_ptrs,
+                expert_gate_out,
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                inter,
+                h,
+                wl_gu,
+                tt_gu,
+                wl_cap_items as u32,
+                stream,
+            )?;
+            ops::moe_fp8_grouped_gemm(
+                ctx.gpu,
+                self.moe_fp8_grouped_gemm_k,
+                input,
+                up.weight_ptrs,
+                up.scale_ptrs,
+                expert_up_out,
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                inter,
+                h,
+                wl_gu,
+                tt_gu,
+                wl_cap_items as u32,
+                stream,
+            )?;
+            ctx.gpu.synchronize(stream)?;
+            ctx.gpu.free(wl_gu)?;
+            ctx.gpu.free(tt_gu)?;
         }
 
         // 6. Activation+mul + down GEMM
         let expert_down_out = ctx.buffers.expert_down_out();
-        if max_m_tiles > 0 {
+        if force_w8a8 && max_m_tiles > 0 {
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,
@@ -251,11 +498,28 @@ impl MoeLayer {
                 total_expanded * inter,
                 stream,
             )?;
-
-            ops::moe_fp8_grouped_gemm(
+            // Quant the permuted post-silu intermediate. Length is
+            // total_expanded, K is `inter` (down_proj input dim).
+            let m: usize = total_expanded as usize;
+            let a_fp8_bytes: usize = m * inter as usize;
+            let a_scale_bytes: usize = m * (inter as usize / 128) * 4;
+            let down_in_fp8 = ctx.gpu.alloc(a_fp8_bytes)?;
+            let down_in_scale = ctx.gpu.alloc(a_scale_bytes)?;
+            ops::per_token_group_quant_fp8(
                 ctx.gpu,
-                fp8_grouped_k,
+                self.per_token_group_quant_fp8_k,
                 expert_gate_out,
+                down_in_fp8,
+                down_in_scale,
+                m as u32,
+                inter,
+                stream,
+            )?;
+            ops::moe_w8a8_grouped_gemm(
+                ctx.gpu,
+                self.moe_w8a8_grouped_gemm_k,
+                down_in_fp8,
+                down_in_scale,
                 dp.weight_ptrs,
                 dp.scale_ptrs,
                 expert_down_out,
@@ -267,6 +531,59 @@ impl MoeLayer {
                 max_m_tiles,
                 stream,
             )?;
+            ctx.gpu.synchronize(stream)?;
+            ctx.gpu.free(down_in_fp8)?;
+            ctx.gpu.free(down_in_scale)?;
+        } else if max_m_tiles > 0 {
+            ops::silu_mul(
+                ctx.gpu,
+                self.moe_act_mul,
+                expert_gate_out,
+                expert_up_out,
+                expert_gate_out,
+                total_expanded * inter,
+                stream,
+            )?;
+            // ── down-proj: separate work-list (N=h, K=inter → different
+            // n_tiles than gate/up). sorted_token_ids=NULL keeps the
+            // direct-index A-prefetch branch (R6). Builder + grouped GEMM on the
+            // SAME `stream`. Down-proj uses dp.weight_ptrs for NULL-skip.
+            let n_tiles_dn = h.div_ceil(PM4_N_TILE);
+            let wl_cap_items = (te.div_ceil(PM4_M_TILE as usize) + ne + 1) * n_tiles_dn as usize;
+            let wl_dn = ctx.gpu.alloc(wl_cap_items * 2 * 4)?;
+            let tt_dn = ctx.gpu.alloc(4)?;
+            ops::moe_build_tile_worklist(
+                ctx.gpu,
+                self.moe_build_tile_worklist_k,
+                expert_offsets,
+                dp.weight_ptrs,
+                wl_dn,
+                tt_dn,
+                num_experts,
+                n_tiles_dn,
+                PM4_M_TILE,
+                stream,
+            )?;
+            ops::moe_fp8_grouped_gemm(
+                ctx.gpu,
+                self.moe_fp8_grouped_gemm_k,
+                expert_gate_out,
+                dp.weight_ptrs,
+                dp.scale_ptrs,
+                expert_down_out,
+                expert_offsets,
+                spark_runtime::gpu::DevicePtr(0),
+                num_experts,
+                h,
+                inter,
+                wl_dn,
+                tt_dn,
+                wl_cap_items as u32,
+                stream,
+            )?;
+            ctx.gpu.synchronize(stream)?;
+            ctx.gpu.free(wl_dn)?;
+            ctx.gpu.free(tt_dn)?;
         }
 
         // 7. Unpermute + weighted reduce + shared blend
@@ -302,6 +619,16 @@ impl MoeLayer {
         // Shared expert blend (post-allreduce).
         if has_shared {
             let shared_down_out = ctx.buffers.attn_output();
+            super::dump::dump_routed_only(ctx.gpu, stream, output, n, h)?;
+            super::dump::dump_shared_out(ctx.gpu, stream, shared_down_out, n, h)?;
+            super::dump::dump_shared_gate(
+                ctx.gpu,
+                stream,
+                input,
+                self.weights.shared_expert_gate.weight,
+                n,
+                h,
+            )?;
             ops::moe_batched_blend(
                 ctx.gpu,
                 self.moe_batched_blend,
@@ -314,6 +641,8 @@ impl MoeLayer {
                 stream,
             )?;
         }
+
+        super::dump::dump_moe_out(ctx.gpu, stream, output, n, h)?;
 
         Ok(())
     }

@@ -104,6 +104,62 @@ pub struct AttnMetadataDev {
     pub num_seqs: u32,
 }
 
+/// Q12 batched-prefill device-side metadata.
+///
+/// The single-stream `AttnMetadataDev` collapses per-stream pointers into
+/// concrete device pointers because there's only one stream. For Q12 we
+/// dispatch N concurrent prefilling streams through one batched kernel,
+/// and the kernel takes:
+///   - stacked positions / slot tables (one big buffer with all streams'
+///     data concatenated in cu_seqlens order), and
+///   - per-stream pointer arrays for block_table / seq_len / h_state.
+///
+/// Built once per `prefill_batch_chunk_dispatch` call by
+/// `stage_batched_attn_metadata`; threaded through the model-level
+/// per-layer batched dispatch (`prefill_attn_batched_layer`,
+/// `prefill_ssm_batched_layer`) — see `model/trait_impl/prefill_b/batch.rs`.
+pub struct BatchedAttnMetadata {
+    /// Stacked positions across all streams: `[total_tokens]` u32 at this
+    /// address. For MRoPE interleaved this is the temporal (T) stream.
+    pub positions_stacked: DevicePtr,
+    /// MRoPE H position stream, stacked. Equal to `positions_stacked` when
+    /// MRoPE is disabled.
+    pub positions_h_stacked: DevicePtr,
+    /// MRoPE W position stream, stacked. Equal to `positions_stacked` when
+    /// MRoPE is disabled.
+    pub positions_w_stacked: DevicePtr,
+    /// Stacked slot indices for KV writes: `[total_tokens]` i64.
+    pub slot_stacked: DevicePtr,
+    /// Per-stream block_table pointer array: `[batch_size]` of `DevicePtr`,
+    /// each element pointing to a stream's chunked-prefill block_table.
+    /// Used by `prefill_attention_paged_*_batched` kernels.
+    pub block_table_ptrs: DevicePtr,
+    /// Per-stream seq_len pointer array: `[batch_size]` of `DevicePtr`.
+    pub seq_len_ptrs: DevicePtr,
+    // Note: `h_state_ptrs` is NOT cached in BatchedAttnMetadata because
+    // it's per-layer (each SSM layer's SsmLayerState has its own h_state
+    // allocation). `prefill_ssm_batched_layer` stages h_state_ptrs JIT
+    // per-layer-call into the model's scratch buffer.
+    /// Number of batched streams.
+    pub batch_size: u32,
+    /// Per-stream chunk_len (SAME for all streams — scheduler-enforced
+    /// constraint via `can_batch_prefill_only`).
+    pub chunk_len: u32,
+    /// Total tokens stacked across streams: `batch_size * chunk_len`.
+    pub total_tokens: u32,
+    /// Maximum block_table length across the batch (kernel uses for
+    /// bounds checking; per-stream block_table reads via the pointer
+    /// array dereference).
+    pub max_blocks_per_seq: u32,
+    /// Exact byte footprint of this metadata block within the scratch
+    /// buffer (from `scratch_offset_bytes` to the end of `seq_len_ptrs`).
+    /// SSOT for the caller's scratch-cursor advance — the per-SSM-layer
+    /// `h_state_ptrs` slot is placed at `scratch_cursor + staged_bytes`, so
+    /// an under-estimate here would overwrite the live `slot_stacked` array
+    /// with device pointers and produce wild KV-cache slots (#110 bug #2).
+    pub staged_bytes: usize,
+}
+
 /// Device pointers to full-sequence GDN input/output buffers.
 ///
 /// Used by the two-phase SSM prefill: phase 1 writes GDN inputs here,
@@ -150,10 +206,21 @@ pub struct ForwardContext<'a> {
     /// True when inside CUDA graph capture (between begin_capture/end_capture).
     /// MoE layers use sync all_reduce (capturable) instead of async (event-based).
     pub graph_capture: bool,
-    /// Per-request MoE expert top-k override. When set, MoE dispatch uses
-    /// this value instead of `config.num_experts_per_tok`. Must be ≤
-    /// `config.num_experts_per_tok` (buffer capacity). Set by the scheduler
-    /// before each forward pass.
+    /// True when this prefill pass continues from a restored Marconi SSM
+    /// snapshot (warm prefix-cache hit). GDN layers must then take the
+    /// bit-faithful WY4 recurrence instead of the FLA chunked kernel: FLA's
+    /// chunk grid is anchored at the (arbitrary) snapshot offset and its
+    /// bf16 intermediates drift vs the pass that originally produced the
+    /// cached K/V, and the replay range [snap_tok, matched) is rewritten
+    /// into SHARED prefix-cache blocks — non-exact recompute poisons them
+    /// and the drift ratchets across turns (2026-06-10 warm-hit stutter).
+    pub gdn_exact_replay: bool,
+    /// Device `[num_tokens]` u32 token IDs for the tokens being processed this
+    /// pass, in the SAME order the per-token MoE loop visits them. Required by
+    /// DeepSeek-V4 hash-MoE layers (static `tid2eid[token_id]` routing); `None`
+    /// for models without hash routing. Must be a STABLE address across the
+    /// layer loop (and, under CUDA-graph decode, uploaded before each replay).
+    pub token_ids: Option<DevicePtr>,
 }
 
 /// A single transformer layer performing the full per-layer computation.

@@ -106,6 +106,12 @@ pub struct MtpHead {
     moe_gate: DenseWeight,
     shared_expert_gate: DenseWeight,
 
+    /// Dense FFN triple `(gate_proj, up_proj, down_proj)` for MTP heads
+    /// bundled with dense (non-MoE) checkpoints. When `Some`, the forward
+    /// path skips routing/expert dispatch and runs a single MLP. The MoE
+    /// fields above are unused/None in that mode.
+    dense_ffn_generic: Option<(ProjectionWeight, ProjectionWeight, ProjectionWeight)>,
+
     // Precision mode
     quant: MtpQuantization,
 
@@ -129,6 +135,12 @@ pub struct MtpHead {
     rope_k: KernelHandle,
     reshape_cache_k: KernelHandle,
     paged_decode_k: KernelHandle,
+    /// MTP KV cache dtype: true = BF16 (matches the main model), false = FP8.
+    /// The FP8 path hard-passed k_scale=v_scale=1.0 which collapsed the MTP
+    /// attention output to a constant on Qwen3.6-A3B (large deep-layer K/V
+    /// magnitudes) → constant draft token 0 → 0% acceptance. BF16 KV (this
+    /// head is a single tiny attention layer) fixes it. Gated by mtp_quant.
+    kv_bf16: bool,
     residual_add_k: KernelHandle,
     residual_add_rms_norm_k: KernelHandle,
     sigmoid_gate_mul_k: KernelHandle,
@@ -341,7 +353,7 @@ impl DraftProposer for MtpHead {
         Ok(())
     }
 
-    fn free_state(&self, state: &mut dyn ProposerState) -> Result<()> {
+    fn free_state(&self, _gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
         let mtp_state = state
             .as_any_mut()
             .downcast_mut::<MtpProposerState>()

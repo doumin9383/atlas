@@ -18,7 +18,6 @@ use crate::layers::MtpQuantization;
 use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
-use crate::weight_map::quantize_to_nvfp4;
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -100,6 +99,54 @@ pub fn build_model(
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(store, &config)?;
     let mtp_weights = loader.load_mtp_weights_multi(store, &config, gpu.as_ref())?;
+
+    // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
+    // the Qwen-shaped `MtpWeights`. Load it via the V4-specific path and keep it
+    // — the `DeepseekV4MtpHead` proposer is built from it after the model is
+    // constructed (it needs the resolved draft NVFP4 LM head + the model's
+    // owned GPU backend) and installed via `set_dflash_proposer`. Only built
+    // when `--speculative` is set; otherwise the module is loaded for
+    // verification then dropped.
+    // Only rank 0 runs the MTP draft (no-EP, all experts local). Skip loading it
+    // on the worker ranks — they never call propose(), so it would be dead weight.
+    let v4_mtp_module =
+        if config.model_type == "deepseek_v4" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::deepseek_v4::load_v4_mtp_module(
+                store,
+                &config,
+                gpu.as_ref(),
+                &attn_layer_dtypes,
+            ) {
+                Ok(Some(m)) => {
+                    tracing::info!(
+                        "DeepSeek-V4 MTP draft module loaded OK (num_mtp_modules={})",
+                        config.num_mtp_modules
+                    );
+                    Some(m)
+                }
+                Ok(None) => {
+                    tracing::info!("DeepSeek-V4: no MTP module in checkpoint (MTP off)");
+                    None
+                }
+                Err(e) => {
+                    tracing::error!("DeepSeek-V4 MTP module load FAILED: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Capability warning: user asked for `--speculative` but the model has no
+    // MTP head bundled, so speculative decoding will silently no-op. Surface
+    // this loudly so the user knows the flag was inert.
+    if use_speculative && mtp_weights.is_empty() {
+        tracing::warn!(
+            "`--speculative` was requested but no MTP weights were loaded for this \
+             model — speculative decoding will be disabled. Either drop `--speculative` \
+             or use a checkpoint that ships an MTP head (e.g. `mtp.safetensors`)."
+        );
+    }
     let vision_encoder = loader.load_vision_encoder(store, &config, gpu.as_ref())?;
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
@@ -127,26 +174,29 @@ pub fn build_model(
         mtp_quant
     };
 
-    // ── Step 3: Quantize LM head to NVFP4 for fast decode ──
-    let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
-    let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
-    let stream = gpu.default_stream();
-    let lm_head_nvfp4 = if config.skip_lm_head_quantization() {
-        tracing::info!("LM head kept as BF16 (skip NVFP4 quantization per model config)");
-        None
-    } else {
-        let q = quantize_to_nvfp4(
-            &lm_head,
-            config.vocab_size,
-            config.hidden_size,
-            gpu.as_ref(),
-            absmax_k,
-            quantize_k,
-            stream,
-        )?;
-        tracing::info!("LM head quantized to NVFP4 (vocab={})", config.vocab_size);
-        Some(q)
-    };
+    // ── Step 3: LM-head quantization (NVFP4 / FP8 / BF16-skip) + the
+    // draft-only NVFP4 head for MTP — extracted to lm_head_setup.rs
+    // (file-size cap; pure code move).
+    let (lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4) = super::lm_head_setup::setup_lm_heads(
+        store,
+        &lm_head,
+        &config,
+        gpu.as_ref(),
+        use_speculative,
+        !mtp_weights.is_empty(),
+    )?;
+
+    // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
+    // MTP proposer BEFORE `embed` / `lm_head_nvfp4` / `mtp_lm_head_nvfp4` are
+    // moved into `TransformerModel::new`. All are `Copy` (DenseWeight /
+    // QuantizedWeight). The draft head resolves to the separate draft-only
+    // NVFP4 head (main head kept BF16) or the main NVFP4 head. `None` ⇒ no
+    // NVFP4 head available ⇒ the V4 proposer can't draft and is skipped.
+    let v4_mtp_embed = embed;
+    // DeepSeek-V4-Flash keeps the LM head in BF16; the proposer drafts with the
+    // same BF16 head via dense_gemv (drafts are re-verified by the target, so the
+    // draft head only affects acceptance). DenseWeight is Copy.
+    let v4_mtp_lm_head = lm_head;
 
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
@@ -211,11 +261,19 @@ pub fn build_model(
     //               Predictor LRU.
     fn dtype_label(dt: KvCacheDtype) -> &'static str {
         match dt {
-            KvCacheDtype::Bf16 => "BF16",
-            KvCacheDtype::Fp8 => "FP8",
+            KvCacheDtype::Bf16
+            | KvCacheDtype::Bf16KTurbo4V
+            | KvCacheDtype::Bf16KTurbo3V
+            | KvCacheDtype::Bf16KTurbo2V => "BF16",
+            KvCacheDtype::Fp8
+            | KvCacheDtype::Fp8KTurbo4V
+            | KvCacheDtype::Fp8KTurbo3V
+            | KvCacheDtype::Fp8KTurbo2V => "FP8",
             KvCacheDtype::Nvfp4 => "NVFP4",
-            KvCacheDtype::Turbo3 => "Turbo3",
-            KvCacheDtype::Turbo4 => "Turbo4",
+            KvCacheDtype::Turbo3 | KvCacheDtype::Turbo3KTurbo8V | KvCacheDtype::Turbo2 => "Turbo3",
+            KvCacheDtype::Turbo4 | KvCacheDtype::Turbo4KTurbo3V | KvCacheDtype::Turbo4KTurbo8V => {
+                "Turbo4"
+            }
             KvCacheDtype::Turbo8 => "Turbo8",
         }
     }
@@ -242,9 +300,26 @@ pub fn build_model(
             summary.join(" + ")
         );
     }
+    // ── gpu_memory_utilization as fraction of TOTAL GPU memory ──
+    //
+    // User-facing contract (matches vLLM / sparkrun convention):
+    //   total_memory × gpu_memory_utilization = hard ceiling on everything
+    //   this process consumes (weights + buffers + KV cache + reserves).
+    //
+    // KV cache gets whatever remains inside that ceiling after deducting
+    // prior allocations (model weights, buffer arena, CUDA context/driver)
+    // and the inference reserve (SSM state pools, CUDA headroom).  A safety
+    // clamp ensures we never exceed what the device can physically provide
+    // right now (handles external memory pressure on shared-memory /
+    // unified-memory systems like GB10).
+    let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
-    let allocatable = actual_free.saturating_sub(inference_reserve);
-    let kv_budget = (allocatable as f64 * gpu_memory_utilization) as usize;
+    let used_so_far = total_mem.saturating_sub(actual_free);
+    let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
+    let kv_budget = total_budget
+        .saturating_sub(used_so_far)
+        .saturating_sub(inference_reserve)
+        .min(actual_free.saturating_sub(inference_reserve));
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -286,13 +361,33 @@ pub fn build_model(
             n
         }
         None => {
+            if kv_budget == 0 {
+                anyhow::bail!(
+                    "No memory left for KV cache: total GPU = {:.1} GB, \
+                     --gpu-memory-utilization {:.0}% → budget {:.1} GB, \
+                     but {:.1} GB already consumed + {:.1} GB inference reserve \
+                     = {:.1} GB committed.  Raise --gpu-memory-utilization or \
+                     use a smaller model.",
+                    total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+                    gpu_memory_utilization * 100.0,
+                    total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                    used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
+                    inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
+                    (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
             let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
             let max_kv_tokens = n * kv_block_size;
             tracing::info!(
-                "KV cache (post-construction): {:.1} GB free, {:.1} GB allocatable, \
-                 {} blocks × {} tok/block = {} max tokens",
-                actual_free as f64 / (1024.0 * 1024.0 * 1024.0),
-                allocatable as f64 / (1024.0 * 1024.0 * 1024.0),
+                "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
+                 {:.1} GB pre-KV + {:.1} GB reserve → {:.1} GB for KV \
+                 → {} blocks × {} tok/block = {} max KV tokens",
+                total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+                gpu_memory_utilization * 100.0,
+                total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
+                inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
+                kv_budget as f64 / (1024.0 * 1024.0 * 1024.0),
                 n,
                 kv_block_size,
                 max_kv_tokens,
@@ -345,6 +440,8 @@ pub fn build_model(
         final_norm,
         lm_head,
         lm_head_nvfp4,
+        lm_head_fp8,
+        mtp_lm_head_nvfp4,
         layers,
         buffers,
         kv_cache,
@@ -363,6 +460,33 @@ pub fn build_model(
         ssm_cache_slots,
         ssm_checkpoint_interval,
     )?;
+
+    // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──
+    //
+    // Built here (not inside `new()`, which only knows the Qwen-shaped
+    // `MtpWeights`) because it needs the model's owned GPU backend, the
+    // resolved draft NVFP4 head, and the shared embedding. Installed via the
+    // existing proposer setter. DFlash (below) is CLI-exclusive with
+    // `--speculative`, so the two never both install.
+    if let Some(v4_module) = v4_mtp_module {
+        match crate::layers::DeepseekV4MtpHead::new(
+            v4_module,
+            v4_mtp_embed,
+            v4_mtp_lm_head,
+            model.config_ref(),
+            model.gpu_backend(),
+            mtp_vocab_size,
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!("DeepSeek-V4 MTP speculative decoding: ENABLED (single-module)");
+            }
+            Err(e) => tracing::warn!(
+                "Failed to build DeepSeek-V4 MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
+        }
+    }
 
     // ── Step 7: DFlash drafter (optional, post-construction) ──
     //

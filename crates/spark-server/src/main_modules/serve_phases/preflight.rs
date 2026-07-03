@@ -37,8 +37,18 @@ pub(crate) fn preflight_reserve(
     } else {
         1
     };
+    // B4 (chunked-prefill BF16 KV cliff): the prior `.min(8192)` cap forced
+    // every prompt > 8 k to chunk, which compounds K-side BF16 rounding noise
+    // at chunk boundaries (per the 4-agent audit 2026-05-27). When the user
+    // explicitly passes `--max-prefill-tokens N` (anything other than the
+    // default 8192), respect it — no hard cap. Otherwise default to 8192 to
+    // bound GDN persistent-buffer reservation for unbounded `max_seq_len`.
     let ssm_prefill_chunk: usize = if config.num_ssm_layers() > 0 {
-        args.max_seq_len.min(8192)
+        if args.max_prefill_tokens != 8192 && args.max_prefill_tokens > 0 {
+            args.max_seq_len.min(args.max_prefill_tokens)
+        } else {
+            args.max_seq_len.min(8192)
+        }
     } else {
         0
     };
@@ -79,8 +89,26 @@ pub(crate) fn preflight_reserve(
         args.block_size,
     )
     .total_bytes();
-    let ssm_snapshot_bytes =
-        args.ssm_cache_slots * config.num_ssm_layers() * (h_state_bytes + conv_state_bytes);
+    // SSM snapshot pool = Marconi prefix-cache region + Phase-C
+    // decode-rollback ring. The decode ring is sized per active
+    // sequence (`DECODE_ROLLBACK_RING_SLOTS` slots × `max_batch_size`),
+    // and only allocated for SSM models. SSOT: this reservation MUST use
+    // the SAME constant the pool actually allocates with
+    // (`SsmSnapshotPool::new` in `impl_a1.rs` uses
+    // `DECODE_ROLLBACK_RING_SLOTS`). It previously used
+    // `ROLLBACK_RESTEER_CAP + 1` (= 3) while the pool allocated
+    // `DECODE_ROLLBACK_RING_SLOTS` (= 8), under-reserving the SSM-snapshot
+    // GPU budget by `(8 - 3) × max_batch_size × num_ssm_layers ×
+    // (h_bytes + conv_bytes)` — the two constants were decoupled when the
+    // ring was widened past the rollback cap.
+    let decode_ring_slots = if config.num_ssm_layers() > 0 {
+        atlas_kernels::DECODE_ROLLBACK_RING_SLOTS
+    } else {
+        0
+    };
+    let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
+        * config.num_ssm_layers()
+        * (h_state_bytes + conv_state_bytes);
     let cuda_headroom: usize =
         if args.speculative || args.self_speculative || args.ngram_speculative {
             4 * 1024 * 1024 * 1024
@@ -118,11 +146,10 @@ pub(crate) fn preflight_reserve(
                 0
             }
         };
-        let suggested = if per_tok_bytes > 0 {
-            (budget_for_seq_term / per_tok_bytes).max(2048)
-        } else {
-            0
-        };
+        let suggested = budget_for_seq_term
+            .checked_div(per_tok_bytes)
+            .map(|q| q.max(2048))
+            .unwrap_or(0);
         let hint = if suggested > 0 && suggested < args.max_seq_len {
             format!(
                 " Try --max-seq-len {} (or lower --max-batch-size / --num-drafts).",
@@ -148,6 +175,30 @@ pub(crate) fn preflight_reserve(
         inference_reserve / (1024 * 1024),
         buffer_arena_bytes / (1024 * 1024),
         free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    // Q09: per-component breakdown so future MTP/spec-decode reserve
+    // jumps are diagnosable from the log alone. Each line is dropped at
+    // debug to avoid noise on hot startup paths; flip to info if you
+    // need to trace a specific deployment's reserve.
+    let spec_on = args.speculative || args.self_speculative || args.ngram_speculative;
+    tracing::debug!(
+        "Preflight reserve breakdown: \
+         ssm_pool={} MB ({}× max_batch × {} ssm_layers × (h+conv)), \
+         ssm_snapshot={} MB ({} slots), \
+         gdn_two_phase={} MB ({} tokens), \
+         cuda_headroom={} MB ({}), \
+         spec_on={}, num_drafts={}",
+        ssm_pool_bytes / (1024 * 1024),
+        ssm_multiplier,
+        config.num_ssm_layers(),
+        ssm_snapshot_bytes / (1024 * 1024),
+        args.ssm_cache_slots,
+        gdn_two_phase_bytes / (1024 * 1024),
+        max_batch_tokens_pre,
+        cuda_headroom / (1024 * 1024),
+        if spec_on { "spec/MTP on" } else { "no spec" },
+        spec_on,
+        if spec_on { args.num_drafts as i64 } else { -1 },
     );
     Ok(ReservePreflight {
         inference_reserve,

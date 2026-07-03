@@ -18,11 +18,18 @@ use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWei
 pub struct MlaWeights {
     pub wq_a: DenseWeight, // [q_lora, h] — Q down-projection (BF16)
     pub wq_a_nvfp4: Option<QuantizedWeight>, // NVFP4 for fast decode
+    /// Native block-scaled FP8 weight (the checkpoint ships these projections as
+    /// FP8-E4M3 + 128×128 block scales). Used by the decode GEMV (w8a16_gemv) so
+    /// the hot path reads 1 byte/elem instead of the BF16-dequant's 2 — lossless
+    /// (the in-kernel dequant keeps F32 precision before the BF16 activation MAC).
+    pub wq_a_fp8: Option<crate::weight_map::Fp8Weight>,
     pub wq_b: DenseWeight, // [n_heads*hd, q_lora] — Q up-projection (BF16)
     pub wq_b_nvfp4: Option<QuantizedWeight>, // NVFP4 for fast decode
-    pub q_a_norm: DenseWeight, // [q_lora] — RMS norm weight
-    pub wkv_a: DenseWeight, // [kv_lora, h] — KV down-projection (BF16)
+    pub wq_b_fp8: Option<crate::weight_map::Fp8Weight>,
+    pub q_a_norm: DenseWeight,                // [q_lora] — RMS norm weight
+    pub wkv_a: DenseWeight,                   // [kv_lora, h] — KV down-projection (BF16)
     pub wkv_a_nvfp4: Option<QuantizedWeight>, // NVFP4 for fast decode
+    pub wkv_a_fp8: Option<crate::weight_map::Fp8Weight>,
     pub wkv_b: DenseWeight, // [n_kv*(nope+v), kv_lora] — KV up-projection (BF16)
     pub kv_a_norm: DenseWeight, // [kv_lora] — RMS norm weight
     pub wkv_a_rope: DenseWeight, // [rope, h] — K RoPE projection (BF16)
@@ -30,6 +37,16 @@ pub struct MlaWeights {
     pub wkv_a_merged: DenseWeight,
     pub wo: DenseWeight, // [h, n_heads*v_dim] — O projection BF16 (for prefill accuracy)
     pub wo_nvfp4: Option<QuantizedWeight>, // O projection NVFP4 (for fast decode GEMV)
+    /// Grouped low-rank O down-projection (wo_a → wo_b) for DeepSeek-V4-Flash.
+    /// When `o_lora_rank > 0`, the decode/prefill paths use wo_a→wo_b instead of `wo`.
+    pub wo_a: DenseWeight, // [o_lora_rank, n_heads*v_dim]
+    pub wo_a_nvfp4: Option<QuantizedWeight>,
+    /// Native block-scaled FP8 wo_a for the grouped decode O-projection. Sliced
+    /// per o_group (block-diagonal) into w8a16_gemv calls.
+    pub wo_a_fp8: Option<crate::weight_map::Fp8Weight>,
+    pub wo_b: DenseWeight, // [h, o_lora_rank]
+    pub wo_b_nvfp4: Option<QuantizedWeight>,
+    pub wo_b_fp8: Option<crate::weight_map::Fp8Weight>,
     /// Absorbed MLA weights for decode (avoid full K/V expansion, preserve precision).
     /// W_UK_T: [n_heads, nope, kv_lora] — Q_nope absorption: Q_absorbed = Q_nope @ W_UK_T
     pub w_uk_t: DenseWeight,
@@ -53,9 +70,76 @@ pub struct MlaWeights {
     pub yarn_inv_freq: spark_runtime::gpu::DevicePtr,
     pub q_lora_rank: usize,
     pub kv_lora_rank: usize,
+    pub o_lora_rank: usize,
     pub nope: usize,
     pub rope: usize,
     pub v_dim: usize,
+    /// DeepSeek Sparse Attention compressor (CSA ratio-4 / HCA ratio-128).
+    /// `None` for full-attention layers (`compress_ratios[L]` == 0).
+    pub compressor: Option<CompressorWeights>,
+    /// Per-head attention sink logit `[num_q_heads]` BF16 (DeepSeek-V4 s_aux).
+    /// NULL if the checkpoint has no attn_sink for this layer.
+    pub attn_sink: spark_runtime::gpu::DevicePtr,
+}
+
+/// DeepSeek-V4 compressed-attention compressor weights (one per compressed layer).
+/// Produces `n_win = usable/ratio` compressed KV entries that are concatenated to
+/// the raw sliding-window KV before core attention. CSA (ratio 4) uses a 2×ratio
+/// overlap window (Ca/Cb); HCA (ratio 128) uses a single non-overlapping window.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressorWeights {
+    /// kv_proj: [proj_dim, hidden]. proj_dim = 2*head_dim (CSA) or head_dim (HCA).
+    pub wkv: DenseWeight,
+    /// gate_proj: same shape as wkv.
+    pub wgate: DenseWeight,
+    /// kv_norm weight `[head_dim]` — STANDARD RMSNorm (loaded via dense_minus_one).
+    pub norm: DenseWeight,
+    /// position_bias / ape: [ratio, proj_dim] BF16, added to the gate before softmax.
+    pub ape: spark_runtime::gpu::DevicePtr,
+    /// compress_rate for this layer (4 = CSA, 128 = HCA).
+    pub ratio: usize,
+    /// proj_dim of wkv/wgate output (2*head_dim for CSA, head_dim for HCA).
+    pub proj_dim: usize,
+    /// true = CSA (2×ratio overlap window); false = HCA (single window).
+    pub is_csa: bool,
+}
+
+/// Per-block Manifold-Constrained Hyper-Connection (mHC) parameters for one
+/// site (attention or FFN). All buffers are float32 device pointers, matching
+/// the checkpoint dtype. See `ops::hc_pre` / `ops::hc_post`.
+pub struct HcSiteWeights {
+    /// Mix projection `fn`: `[mix_hc, hc_mult*hidden]` f32, where
+    /// `mix_hc = (2 + hc_mult) * hc_mult`.
+    pub hc_fn: DevicePtr,
+    /// Mix bias `base`: `[mix_hc]` f32.
+    pub hc_base: DevicePtr,
+    /// Mix scale: `[3]` f32 (pre / post / comb scalars).
+    pub hc_scale: DevicePtr,
+}
+
+/// Both HC sites for a DeepSeek-V4 block: the attention site runs before/after
+/// attention, the FFN site before/after the MoE FFN.
+/// Model-level HC head parameters (final collapse before LM head).
+/// Loaded once, attached to every layer, but only used by the last layer.
+#[derive(Clone)]
+pub struct HcHeadWeights {
+    /// Mix projection `head_fn`: `[hc_mult, hc_mult*hidden]` f32.
+    pub hc_fn: DevicePtr,
+    /// Mix bias `head_base`: `[hc_mult]` f32.
+    pub hc_base: DevicePtr,
+    /// Mix scale: `[1]` f32.
+    pub hc_scale: DevicePtr,
+}
+
+pub struct HcWeights {
+    pub attn: HcSiteWeights,
+    pub ffn: HcSiteWeights,
+    /// Model-level head weights. `Some` on all layers (replicated pointer),
+    /// consumed only by the last layer's `hc_head` call.
+    pub head: Option<HcHeadWeights>,
+    pub hc_mult: usize,
+    pub sinkhorn_iters: usize,
+    pub hc_eps: f32,
 }
 
 /// Qwen3-Next full attention layer (12 of 48 layers).
@@ -91,7 +175,14 @@ pub struct Qwen3AttentionLayer {
     pub(crate) k_eq_v: bool,
     /// Ones-filled BF16 weight buffer for the pure-RMSNorm v_norm path.
     pub(crate) v_norm_weight: Option<DenseWeight>,
-    /// Post-attention output norm (Gemma-4).
+    /// Per-head attention gate weight (Step 3.7 g_proj).
+    /// Shape: [num_q_heads, hidden_size] BF16. Applied as:
+    /// attn_out = attn_out * sigmoid(g_proj @ hidden_states)
+    /// with broadcast over head_dim.
+    pub(crate) head_gate_weight: Option<DenseWeight>,
+    /// Kernel handle for per-head sigmoid gate broadcast multiply.
+    pub(super) sigmoid_gate_head_broadcast_k: KernelHandle,
+    /// Post-attention output norm (Gemma-4).  
     pub(crate) post_attn_out_norm: Option<DenseWeight>,
     /// Post-FFN output norm (Gemma-4).
     pub(crate) post_ffn_out_norm: Option<DenseWeight>,
@@ -120,6 +211,19 @@ pub struct Qwen3AttentionLayer {
     pub(super) o_dense_bf16: Option<DenseWeight>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
+    // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
+    /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
+    /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`
+    /// against the `hc_streams` buffer instead of the standard residual add.
+    pub(crate) hc: Option<HcWeights>,
+    /// HC `hc_pre` kernel handle (NULL when HC disabled).
+    pub(super) hc_pre_k: KernelHandle,
+    /// HC `hc_post` kernel handle (NULL when HC disabled).
+    pub(super) hc_post_k: KernelHandle,
+    /// HC `hc_expand` kernel handle (NULL when HC disabled).
+    pub(super) hc_expand_k: KernelHandle,
+    /// HC `hc_head` kernel handle (NULL when HC disabled).
+    pub(super) hc_head_k: KernelHandle,
     // ── Transposed weights for prefill GEMM ──
     pub(super) q_nvfp4_t: Option<QuantizedWeight>,
     pub(super) k_nvfp4_t: Option<QuantizedWeight>,
@@ -130,6 +234,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) v_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     pub(super) o_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     pub(super) w8a16_gemm_t_k: KernelHandle,
+    pub(super) w8a16_gemm_t_pipelined_k: KernelHandle,
+    // W8A8 + FP32 epilogue (vLLM-equivalent) — gated by ATLAS_FP8_W8A8=1.
+    pub(super) per_token_group_quant_fp8_k: KernelHandle,
+    pub(super) fp8_gemm_t_blockscaled_k: KernelHandle,
     // Kernels — decode (GEMV M=1)
     pub(super) rms_norm_k: KernelHandle,
     pub(super) rms_norm_residual_k: KernelHandle,
@@ -139,22 +247,52 @@ pub struct Qwen3AttentionLayer {
     pub(super) w4a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,
+    pub(super) w8a16_gemm_pipelined_k: KernelHandle,
     pub(super) w4a16_gemv_dual_k: KernelHandle,
     pub(super) rope_k: KernelHandle,
     /// MRoPE-interleaved kernel.
     pub(super) rope_mrope_interleaved_k: KernelHandle,
     /// YaRN RoPE kernel using pre-computed inv_freq table (Mistral, etc.)
     pub(super) rope_yarn_k: KernelHandle,
+    /// Interleaved (GPT-J / is_neox_style=False) YaRN RoPE kernel — DeepSeek MLA.
+    pub(super) rope_yarn_interleaved_k: KernelHandle,
+    /// Conjugate (negated-sin) interleaved YaRN RoPE — DeepSeek-V4 attention
+    /// output de-rotation (eq.26).
+    pub(super) rope_yarn_interleaved_inv_k: KernelHandle,
     /// Proportional RoPE kernel (Gemma-4 full-attention layers).
     pub(super) rope_proportional_k: KernelHandle,
     pub(super) reshape_cache_k: KernelHandle,
+    /// Fused k_norm + RoPE + paged BF16 cache write — eliminates two
+    /// intermediate BF16 rounding steps that cause the documented L35-L39
+    /// cliff in chunked-prefill BF16 KV mode (memory:
+    /// `project_qwen36_phase2b_softmax_expf.md`).
+    pub(super) fused_k_norm_rope_cache_write_bf16_k: KernelHandle,
+    /// MRoPE-interleaved variant of the above. Same precision regime.
+    /// Dispatched when `mrope_interleaved` is true.
+    pub(super) fused_k_norm_rope_mrope_cache_write_bf16_k: KernelHandle,
+    /// V-only paged cache write. Used alongside the fused K-path so the
+    /// K side of the cache stays single-rounded.
+    pub(super) reshape_and_cache_flash_v_only_k: KernelHandle,
     /// WHT kernel for turbo KV cache.
     pub(super) wht_bf16_k: KernelHandle,
+    /// Inverse WHT. With TQ_PLUS_SIGNS off this aliases the forward kernel
+    /// (plain WHT is self-inverse); with TQ+ signs the inverse reverses the
+    /// signs1/signs2 order, which is required because (S2·H·S1)·(S2·H·S1) ≠ I.
+    pub(super) wht_bf16_k_inv: KernelHandle,
+    /// InnerQ application kernels (Q pre-WHT scale_inv, K post-WHT scale).
+    /// Returns 0 handle when InnerQ kernel module isn't loaded — caller should
+    /// guard launches with `.0 != 0`.
+    pub(super) innerq_apply_q_k: KernelHandle,
+    pub(super) innerq_apply_k_k: KernelHandle,
     pub(super) paged_decode_k: KernelHandle,
     /// HDIM=512 paged decode kernel for Gemma-4 full-attention layers
     pub(super) paged_decode_512_k: KernelHandle,
     /// MLA absorbed paged decode kernel (HDIM=320).
     pub(super) paged_decode_mla_k: KernelHandle,
+    /// MLA paged decode kernel for DeepSeek-V4-Flash (compressed KV cache: 576 dims)
+    pub(super) mla_paged_decode_k: KernelHandle,
+    /// MLA paged decode kernel for DeepSeek-V4-Flash with FP8 KV cache
+    pub(super) mla_paged_decode_fp8_k: KernelHandle,
     /// MLA batched GEMV for Q absorption and V extraction.
     pub(super) mla_batched_gemv_k: KernelHandle,
     /// MLA fused kernels — decode.
@@ -186,6 +324,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) deinterleave_qg_k: KernelHandle,
     pub(super) w4a16_gemv_qg_k: KernelHandle,
     pub(super) residual_add_rms_norm_k: KernelHandle,
+    /// Dual-output (bf16 + f32) MoE-input norm for ATLAS_FP32_ROUTING. Zero if absent.
+    pub(super) residual_add_rms_norm_gatef32_k: KernelHandle,
     // Kernels — batch2 (K=2 verify)
     pub(super) w4a16_gemv_qg_batch2_k: KernelHandle,
     pub(super) w4a16_gemv_dual_batch2_k: KernelHandle,
@@ -207,6 +347,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) prefill_attn_k: KernelHandle,
     /// HDIM=512 contiguous prefill for Gemma-4 full-attention layers
     pub(super) prefill_attn_512_k: KernelHandle,
+    /// DeepSeek-V4 CSA compressor: window softmax-gated KV compression.
+    pub(super) csa_compress_k: KernelHandle,
+    /// DeepSeek-V4 CSA prefill attention over [raw | compressed] KV + sink.
+    pub(super) prefill_attn_compressed_k: KernelHandle,
     /// HDIM=512 paged prefill (BF16 KV) for Gemma-4 chunked long-context prefill
     pub(super) prefill_attn_paged_512_k: KernelHandle,
     pub(super) prefill_attn_64_k: KernelHandle,
@@ -218,7 +362,39 @@ pub struct Qwen3AttentionLayer {
     pub(super) prefill_attn_paged_64_k: KernelHandle,
     pub(super) prefill_attn_paged_fp8_64_k: KernelHandle,
     pub(super) prefill_attn_paged_nvfp4_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_turbo2_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_turbo3_64_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo4_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_turbo8_64_k: KernelHandle,
+    // ── TurboQuant+ asymmetric BR=64 prefill kernels ──
+    // Combined-dtype kernels that read K and V with different on-disk layouts.
+    // Currently: Bf16K + Turbo3V (safer-asym variant — K kept at bf16 precision,
+    // V aggressively compressed to 3-bit Lloyd-Max + FP8 group scale).
+    pub(super) prefill_attn_paged_bf16k_turbo3v_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_bf16k_turbo4v_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_bf16k_turbo2v_64_k: KernelHandle,
+    // Fp8K + TurboNV variants — same shape as bf16k_turbo*v_64 but threads
+    // the FP8 K-side per-tensor `k_scale` through to the dequant in
+    // LOAD_K_TILE. Targets FP8-attention models (Qwen3.6-35B-FP8 etc.).
+    pub(super) prefill_attn_paged_fp8k_turbo3v_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_fp8k_turbo4v_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_fp8k_turbo2v_64_k: KernelHandle,
+    // Both-sides-quantized TurboQuant+ asym (K and V both turbo, separate
+    // pool strides). K-side WHT bookend + Q WHT both fire because K is turbo.
+    pub(super) prefill_attn_paged_turbo4k_turbo3v_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_turbo4k_turbo8v_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_turbo3k_turbo8v_64_k: KernelHandle,
+    // ── Q12 Phase 3: same-chunk-len batched paged-prefill kernels ──
+    // Each takes `const int* const* block_table_ptrs` + per-batch Q/O
+    // offsets. Used by `Qwen3AttentionLayer::prefill_batched` when N≥2
+    // streams share the same chunk_len. Null on targets that don't
+    // carry the corresponding kernel (e.g. CPU backend).
+    pub(super) prefill_attn_paged_batched_k: KernelHandle,
+    pub(super) prefill_attn_paged_fp8_batched_k: KernelHandle,
+    pub(super) prefill_attn_paged_nvfp4_batched_k: KernelHandle,
+    pub(super) prefill_attn_paged_batched_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_fp8_batched_64_k: KernelHandle,
+    pub(super) prefill_attn_paged_nvfp4_batched_64_k: KernelHandle,
     // Batched prefill kernels
     pub(super) deinterleave_qg_split_k: KernelHandle,
     pub(super) deinterleave_qg_split_qnorm_k: KernelHandle,

@@ -11,9 +11,9 @@ use super::*;
 /// continuation distribution (token 131071 / Chinese-character loops have
 /// been observed). Bare JSON keeps the model on its trained distribution.
 ///
-/// Always paired with `tool_choice="required"` semantics so xgrammar enforces
-/// the schema from token 1; without that the model would hallucinate field
-/// names like `"tool"` instead of `"name"`.
+/// In `tool_choice="auto"` mode, xgrammar waits for the bare JSON trigger so
+/// the model can still answer with normal text. Explicit required/specific
+/// choices enforce the schema from token 1.
 pub struct BareJsonParser;
 
 impl ToolCallParser for BareJsonParser {
@@ -35,7 +35,9 @@ impl ToolCallParser for BareJsonParser {
     }
 
     fn system_prompt(&self, tools: &[ToolDefinition], tool_choice: &ToolChoice) -> String {
-        let tools_json = serde_json::to_string(tools).unwrap_or_else(|_| "[]".into());
+        let tools_json = tool_list_body(tools, || {
+            serde_json::to_string(tools).unwrap_or_else(|_| "[]".into())
+        });
         let mut prompt = format!(
             "You are a function-calling AI model. You have access to the following tools, \
              provided as JSON schemas inside <tools></tools>:\n<tools>\n{tools_json}\n</tools>\n\n\

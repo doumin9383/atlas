@@ -50,7 +50,28 @@ pub(super) fn build_full_attention_nvfp4(
                               full_k: usize,
                               kind: TpShardKind|
              -> Result<crate::weight_map::QuantizedWeight> {
-                let src = quantized_auto(store, &format!("{p}.{name}"), gpu, variant)?;
+                let prefix = format!("{p}.{name}");
+                // Mixed-precision compressed-tensors checkpoints (lovedheart
+                // AgentWorld-35B-NVFP4) NVFP4-pack the MoE experts but keep
+                // attention q/k/v/o as block-scaled FP8 (`.weight` FP8E4M3 + 2D
+                // `.weight_scale`, no `.weight_packed`). When the pack metadata
+                // is absent, dequant per-tensor and runtime-quantize to NVFP4
+                // (mirrors the Standard arm) instead of failing on the missing
+                // `weight_packed`.
+                let src = if store.contains(&format!("{prefix}.weight_packed")) {
+                    quantized_auto(store, &prefix, gpu, variant)?
+                } else {
+                    let dense_bf16 = dense_auto(store, &format!("{prefix}.weight"), gpu)?;
+                    quantize_to_nvfp4(
+                        &dense_bf16,
+                        full_n,
+                        full_k,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        stream,
+                    )?
+                };
                 if tp_size == 1 {
                     return Ok(src);
                 }
@@ -94,6 +115,33 @@ pub(super) fn build_full_attention_nvfp4(
                     let sharded = DenseWeight {
                         weight: sharded_ptr,
                     };
+                    // TQ+ weight pre-rotation: apply canonical Rademacher rotation
+                    // S2·H·S1 to Q/K/V columns per-head BEFORE quantization. When
+                    // active (TQ_PLUS_WEIGHT_ROTATION=1) the runtime wht_bf16_inplace
+                    // launches on Q/K/V become redundant. O projection skipped (the
+                    // input-side rotation needs a transpose). hd=128 only — 256/512
+                    // sign arrays not yet vendored.
+                    if super::tq_plus_weight_rotation::weight_rotation_enabled()
+                        && (name == "q_proj" || name == "k_proj" || name == "v_proj")
+                        && config.head_dim == 128
+                    {
+                        let n_heads = local_n / config.head_dim;
+                        if n_heads * config.head_dim == local_n && n_heads > 0 {
+                            let _ =
+                                super::tq_plus_weight_rotation::apply_canonical_rotation_inplace(
+                                    gpu,
+                                    sharded_ptr,
+                                    local_k,
+                                    n_heads,
+                                    config.head_dim,
+                                    stream,
+                                );
+                            tracing::info!(
+                                "TQ+ weight rotation applied: {name} ({n_heads}h × {}hd)",
+                                config.head_dim
+                            );
+                        }
+                    }
                     let q = quantize_to_nvfp4(
                         &sharded, local_n, local_k, gpu, absmax_k, quantize_k, stream,
                     )?;

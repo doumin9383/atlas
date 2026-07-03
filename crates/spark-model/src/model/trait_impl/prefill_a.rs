@@ -44,21 +44,35 @@ impl TransformerModel {
             None => return Ok(()),
         };
         let stream = self.gpu.default_stream();
-        let mut total_patches = 0usize;
-        let mut post_merge_grids: Vec<(usize, usize)> = Vec::with_capacity(images.len());
-        let sms = ve.spatial_merge_size.max(1);
-        for (pixels, grid_h, grid_w) in images {
-            let p = ve.forward(pixels, *grid_h, *grid_w, self.gpu.as_ref(), stream)?;
-            total_patches += p;
-            // Record post-merge dimensions for downstream MRoPE position
-            // computation. The ViT folds `sms × sms` pre-merge patches into
-            // a single output embedding, so the effective spatial grid
-            // shrinks by that factor in each axis.
-            post_merge_grids.push((grid_h / sms, grid_w / sms));
+        // ONE batched ViT forward over all images in this request — block GEMM
+        // weights read once over Σpatches instead of N× (the per-image loop also
+        // overwrote buf_out row 0 every call, corrupting multi-image requests).
+        // Each returned (post_h, post_w, merged_p) preserves image order, so the
+        // packed buf_out matches the pad-token splice order downstream.
+        let img_refs: Vec<(&[f32], usize, usize)> = images
+            .iter()
+            .map(|(px, gh, gw)| (px.as_slice(), *gh, *gw))
+            .collect();
+        let _vt0 = std::time::Instant::now();
+        let per_image = ve.forward_batched(&img_refs, self.gpu.as_ref(), stream)?;
+        if std::env::var("ATLAS_VISION_TIMING").is_ok() {
+            self.gpu.synchronize(stream).ok();
+            tracing::info!(
+                "VIT_TIMING self-encode {} imgs: {:.1}ms",
+                images.len(),
+                _vt0.elapsed().as_secs_f64() * 1000.0
+            );
         }
-        *self.vision_embed_patches.lock() = total_patches;
+        let post_merge_grids: Vec<(usize, usize)> =
+            per_image.iter().map(|(h, w, _)| (*h, *w)).collect();
+        let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
+        *self.vision_embed_patches.lock() = total_merged;
         *self.vision_image_grids.lock() = post_merge_grids;
-        tracing::info!("Vision encoder: {} patches encoded", total_patches);
+        tracing::info!(
+            "Vision encoder (batched): {} images, {} merged patches encoded",
+            images.len(),
+            total_merged
+        );
         Ok(())
     }
 
@@ -89,24 +103,15 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let _bf16 = 2usize;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
+        let fp32 = 2usize;
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
-        // EP=1: zero only essential buffers (hidden + residual + MoE routing).
-        // EP=2: zero ALL buffers — the NCCL all-reduce path reads buffers that
-        // may carry stale data from prior requests with different token counts.
-        // The EP=2 CUDA 700 was from the 4MB recv buffer overflow (fixed in 1ae4883),
-        // but we keep zero_all for EP=2 as defense-in-depth.
-        if self.comm.is_some() {
-            self.buffers.zero_all(self.gpu.as_ref(), stream)?;
-        } else {
-            self.buffers.zero_all(self.gpu.as_ref(), stream)?;
-        }
+        // Zero ALL buffers (EP=1 and EP=2) — the NCCL all-reduce path reads
+        // buffers that may carry stale data from prior requests with different
+        // token counts. The EP=2 CUDA 700 was from the 4MB recv buffer overflow
+        // (fixed in 1ae4883); zero_all kept everywhere as defense-in-depth.
+        self.buffers.zero_all(self.gpu.as_ref(), stream)?;
 
         let mut kv_cache = self.kv_cache.lock();
 
@@ -265,6 +270,11 @@ impl TransformerModel {
             let token_ids_dev = self.buffers.scratch();
             self.gpu
                 .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
+            // Also stage token IDs into the STABLE token_ids buffer (scratch is
+            // reused for MoE routing during the layer loop). DeepSeek-V4 hash-MoE
+            // layers read `tid2eid[token_id]` per token, in this same order.
+            self.gpu
+                .copy_h2d_async(token_ids_bytes, self.buffers.token_ids(), stream)?;
             ops::batched_embed(
                 self.gpu.as_ref(),
                 self.batched_embed_kernel,
@@ -371,14 +381,29 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: false,
+            // Marconi warm hit: GDN layers replay from a restored SSM state
+            // and must use the bit-faithful WY4 recurrence (see layer.rs).
+            gdn_exact_replay: marconi_skip,
+            // Hash-MoE: token IDs for the `proc_count` tokens processed this
+            // pass, in MoE-loop order (uploaded above to the stable buffer).
+            token_ids: Some(self.buffers.token_ids()),
         };
 
         // ── 4. Forward through all layers ──
         // When Marconi skip is active, seq_len_start > 0 triggers paged attention
-        // in attention layers. SSM layers process only proc_count tokens using
-        // restored h_state + conv_state. kv_write_start=0 because ALL tokens in
-        // the batch are uncached (cached ones were skipped entirely).
-        let layer_kv_write_start = if marconi_skip { 0 } else { kv_write_start };
+        // in attention layers. SSM layers process only proc_count tokens
+        // using restored h_state + conv_state. On a Marconi intermediate hit
+        // the first (matched - snap_tok) processed tokens replay positions
+        // already in shared prefix-cache blocks — write-floor them so
+        // attention can't rewrite cached K/V with non-bit-exact recompute
+        // (see prefill_b/forward_layers.rs). Leaf hit → floor 0 (all new).
+        let layer_kv_write_start = if marconi_skip {
+            seq.cached_prefix_tokens
+                .saturating_sub(seq_len_start)
+                .min(proc_count)
+        } else {
+            kv_write_start
+        };
         let diag_prefill = self.profile && proc_count > 1; // Only with --profile
         for (i, layer) in self.layers.iter().enumerate() {
             layer
@@ -479,6 +504,10 @@ impl TransformerModel {
         // ── 7. Update sequence state ──
         seq.tokens.extend_from_slice(tokens);
         seq.seq_len = n;
+        // #155: prime the decode-checkpoint cadence gate so the first decode
+        // checkpoint never fires on a block boundary the prompt already
+        // crossed (would snapshot 1-2 tokens past the prompt edge).
+        seq.last_decode_ckpt_block = seq.tokens.len() / bs;
 
         // ── 8. Insert into prefix cache + save SSM snapshot for Marconi ──
         self.prefill_save_snapshot_with_vision_gate(tokens, seq, &mut kv_cache, bs, stream);

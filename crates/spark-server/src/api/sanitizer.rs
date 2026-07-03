@@ -24,21 +24,6 @@ use crate::tool_parser;
 use super::chat::chat_completions_inner;
 use super::compact::{compact_messages, openai_error_response, openai_error_response_with_param};
 use super::completions::not_supported;
-use super::failures::{
-    F23ProgressMetrics, F29EnvironmentFact, F37FailureClass, F39FailureCache,
-    F39PermanentFailureMatch, F49DuplicateWrite, append_f7_reminder_to_last_user,
-    build_f7_stall_reminder, bump_f12_tool_call_count, check_loop_watchdog,
-    collect_f7_stall_buckets, f23_build_reminder, f23_normalize_and_hash, f23_refuse_threshold,
-    f23_score_progress, f23_warn_threshold, f28_text_looks_like_error,
-    f29_extract_binary_from_error_line, f29_extract_environment_facts,
-    f29_inject_environment_facts, f31_inject_hard_refusal, f32_reposition_failed_tool_result,
-    f37_classify_failure, f39_build_circuit_breaker_banner, f39_build_failure_cache,
-    f39_class_label, f39_detect_recent_retries, f39_extract_binary_name,
-    f44_check_permanent_failure, f49_build_banner, f49_detect_duplicate_writes,
-    f49_extract_write_path_and_content, f50_append_original_error, f60_disable_mtp_for_request,
-    flush_content_sanitizer, prepend_reminder_to_system, recent_message_is_tool_error,
-    strip_xml_leaks_from_assistant_content,
-};
 use super::inference_impl::{extract_thinking, strip_stop_sequences, tokenize_stop_sequences};
 use super::inference_types::{
     GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
@@ -393,4 +378,82 @@ pub fn primary_arg_for_tool(name: &str, args_json: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolKind, classify_tool, extract_bash_final_action, primary_arg_for_tool};
+
+    #[test]
+    fn bash_final_action_returns_last_segment() {
+        let out =
+            extract_bash_final_action("mkdir -p /tmp/x/src && cd /tmp/x && cargo init --name a");
+        assert!(out.starts_with("cargo init"), "got: {out}");
+    }
+
+    #[test]
+    fn bash_final_action_no_chain_returns_original() {
+        let out = extract_bash_final_action("ls -la /tmp/x");
+        assert!(out.starts_with("ls -la"));
+    }
+
+    #[test]
+    fn bash_final_action_empty_returns_empty() {
+        assert_eq!(extract_bash_final_action(""), "");
+    }
+
+    #[test]
+    fn classify_tool_case_insensitive() {
+        assert_eq!(classify_tool("Bash"), ToolKind::Bash);
+        assert_eq!(classify_tool("bash"), ToolKind::Bash);
+        assert_eq!(classify_tool("BASH"), ToolKind::Bash);
+        assert_eq!(classify_tool("Write"), ToolKind::Write);
+        assert_eq!(classify_tool("Edit"), ToolKind::Edit);
+        assert_eq!(classify_tool("Read"), ToolKind::Read);
+        assert_eq!(classify_tool("MultiEdit"), ToolKind::MultiEdit);
+        assert_eq!(classify_tool("multiedit"), ToolKind::MultiEdit);
+    }
+
+    #[test]
+    fn classify_tool_unknown_is_other() {
+        assert_eq!(classify_tool("GetWeather"), ToolKind::Other);
+        assert_eq!(classify_tool(""), ToolKind::Other);
+        assert_eq!(classify_tool("Bashly"), ToolKind::Other);
+    }
+
+    #[test]
+    fn primary_arg_write_snake_and_camel() {
+        let out = primary_arg_for_tool("Write", r#"{"file_path":"/tmp/x.rs"}"#);
+        assert_eq!(out.as_deref(), Some("/tmp/x.rs"));
+        let out = primary_arg_for_tool("write", r#"{"filePath":"/tmp/y.rs"}"#);
+        assert_eq!(out.as_deref(), Some("/tmp/y.rs"));
+    }
+
+    #[test]
+    fn primary_arg_bash_collapses_chain() {
+        let out = primary_arg_for_tool("Bash", r#"{"command":"cd /tmp && cargo build"}"#);
+        assert!(out.as_ref().is_some_and(|s| s.starts_with("cargo build")));
+    }
+
+    #[test]
+    fn primary_arg_unknown_tool_falls_back() {
+        // ToolKind::Other has no well-known key but fallback path may
+        // return the first non-empty string field.
+        let out = primary_arg_for_tool("GetWeather", r#"{"location":"Paris"}"#);
+        assert!(
+            out.is_some(),
+            "fallback path should return some(location=Paris)"
+        );
+    }
+
+    #[test]
+    fn primary_arg_malformed_json_returns_none() {
+        assert_eq!(primary_arg_for_tool("Write", "not json"), None);
+    }
+
+    #[test]
+    fn primary_arg_missing_key_returns_none() {
+        let out = primary_arg_for_tool("Write", r#"{"content":"fn main(){}"}"#);
+        assert_eq!(out, None);
+    }
 }

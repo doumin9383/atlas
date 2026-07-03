@@ -96,14 +96,33 @@ impl Qwen3AttentionLayer {
         // Window of HBM-resident blocks: block_table[0..block_table.len()]
         // covers logical positions [total - block_table.len(), total).
         let window_start = total.saturating_sub(block_table.len());
-        // Always re-offload the ACTIVE (last) block on every call. Decode
-        // writes one new slot per step into the existing last block — its
-        // HBM contents change without disk_block_ids.len() growing, so the
-        // naive `last..total` range would skip it and the streaming kernel
-        // would read stale (zero-init) bytes for slots 1..15 → degenerate
-        // attention → "the the the" loop. Setting `start = last.min(total-1)`
-        // guarantees the active block is re-pushed every step.
-        let start = last.min(total - 1);
+        // Always re-offload the BOUNDARY block (one before `last`) on every
+        // call, in addition to all blocks in `last..total`. Two cases:
+        //
+        // (1) Decode case: `last == total` (no new block this step). Slots in
+        //     the active block keep getting written one-per-step without
+        //     `disk_block_ids.len()` growing. `start = total - 1` ensures the
+        //     active block is re-pushed every step. Without this the streaming
+        //     kernel reads stale (zero-init) bytes for the unwritten slots
+        //     → degenerate attention → "the the the" loop.
+        //
+        // (2) Chunked-prefill boundary case (issue #31, follow-up to PR #37):
+        //     `last < total` after a new chunk advanced `disk_block_ids`. The
+        //     PREVIOUS chunk's last block (`last - 1`) typically has unwritten
+        //     tail slots — `reshape_and_cache_flash` writes only the chunk's
+        //     own token slots, so when chunk N ended mid-block it left the
+        //     tail slots zero on disk after the post-chunk-N offload. Chunk
+        //     N+1 fills those tail slots in HBM but the offload's `start =
+        //     last` skipped re-pushing the boundary block, so disk's
+        //     boundary-block tail stays permanently zeroed. Decode reads the
+        //     full history from disk via `attend_layer_on_stream`, so the
+        //     zeroed slots silently corrupt attention for the chunk-boundary
+        //     positions (manifests as needle-in-haystack precision loss in
+        //     long-context recall — see issue #31 differential tests).
+        //
+        // `last.saturating_sub(1).min(total - 1)` covers both cases at the
+        // cost of ~one extra D2H per layer per chunk (negligible).
+        let start = last.saturating_sub(1).min(total - 1);
         for logical_pos in start..total {
             if logical_pos < window_start {
                 // Issue #31: the slide-before-alloc loop in
@@ -165,7 +184,10 @@ impl Qwen3AttentionLayer {
             let nkv_us = nkv as usize;
             let hd_us = hd as usize;
             match layer_dtype {
-                KvCacheDtype::Bf16 => {
+                KvCacheDtype::Bf16
+                | KvCacheDtype::Bf16KTurbo4V
+                | KvCacheDtype::Bf16KTurbo3V
+                | KvCacheDtype::Bf16KTurbo2V => {
                     // copy_d2h_on_stream: orders the D2H after WHT+reshape_and_cache
                     // on the production stream. copy_d2h would race (default-stream
                     // sync only) and read torn bytes — Turbo8 race fix, 2026-04-28.
@@ -190,7 +212,10 @@ impl Qwen3AttentionLayer {
                         stream,
                     )?;
                 }
-                KvCacheDtype::Fp8 => {
+                KvCacheDtype::Fp8
+                | KvCacheDtype::Fp8KTurbo4V
+                | KvCacheDtype::Fp8KTurbo3V
+                | KvCacheDtype::Fp8KTurbo2V => {
                     let mut k_raw = vec![0u8; block_floats];
                     let mut v_raw = vec![0u8; block_floats];
                     ctx.gpu.copy_d2h_on_stream(
@@ -207,7 +232,10 @@ impl Qwen3AttentionLayer {
                     dequant_fp8_to_bf16(&k_raw, k_scale, &mut k_host);
                     dequant_fp8_to_bf16(&v_raw, v_scale, &mut v_host);
                 }
-                KvCacheDtype::Nvfp4 | KvCacheDtype::Turbo4 => {
+                KvCacheDtype::Nvfp4
+                | KvCacheDtype::Turbo4
+                | KvCacheDtype::Turbo4KTurbo3V
+                | KvCacheDtype::Turbo4KTurbo8V => {
                     let mut k_raw = vec![0u8; layer_block_bytes];
                     let mut v_raw = vec![0u8; layer_block_bytes];
                     ctx.gpu.copy_d2h_on_stream(
@@ -228,7 +256,7 @@ impl Qwen3AttentionLayer {
                     dequant_4bit_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, lut, &mut k_host);
                     dequant_4bit_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, lut, &mut v_host);
                 }
-                KvCacheDtype::Turbo3 => {
+                KvCacheDtype::Turbo3 | KvCacheDtype::Turbo3KTurbo8V | KvCacheDtype::Turbo2 => {
                     let mut k_raw = vec![0u8; layer_block_bytes];
                     let mut v_raw = vec![0u8; layer_block_bytes];
                     ctx.gpu.copy_d2h_on_stream(
@@ -263,7 +291,10 @@ impl Qwen3AttentionLayer {
             }
             spark_storage::with_local(|hss| {
                 match layer_dtype {
-                    KvCacheDtype::Bf16 => hss.offload_block_on_stream(
+                    KvCacheDtype::Bf16
+                    | KvCacheDtype::Bf16KTurbo4V
+                    | KvCacheDtype::Bf16KTurbo3V
+                    | KvCacheDtype::Bf16KTurbo2V => hss.offload_block_on_stream(
                         stream,
                         layer_u32,
                         disk_id,

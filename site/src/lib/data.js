@@ -1,7 +1,7 @@
 // Central data source for all site content.
 // Any copy changes land here. Components are just presentation.
 
-export const discordUrl = 'https://discord.gg/DwF3brBMpw';
+export const discordUrl = 'https://discord.gg/6vDbKaKrKD';
 // The post that started it all.
 export const firstPostUrl = 'https://www.reddit.com/r/LocalLLaMA/comments/1rkefjw/solved_the_dgx_spark_102_stable_toks_qwen3535ba3b/';
 // Second Atlas post; testimonial comments came from this thread.
@@ -79,13 +79,14 @@ export const benchmarks = [
 
 export const models = [
   { name: 'Qwen3.6-35B-A3B', badges: ['MTP', 'FP8'], params: '35B (3B active)', quant: 'FP8', arch: 'GDN + Attention + MoE (Vision)', tps: '~71 tok/s' },
+  { name: 'Qwen3.6-27B', badges: ['MTP', 'FP8'], params: '27B (dense)', quant: 'FP8', arch: 'GDN + Attention (Dense)', tps: '~15 tok/s' },
   { name: 'Qwen3.5-35B-A3B', badges: ['MTP', 'FP8'], params: '35B (3B active)', quant: 'NVFP4 / FP8', arch: 'GDN + Attention + MoE', tps: '~130 tok/s' },
   { name: 'Qwen3.5-122B-A10B', badges: ['MTP', 'EP2'], params: '122B (10B active)', quant: 'NVFP4', arch: 'GDN + Attention + MoE', tps: '~38 tok/s' },
-  { name: 'MiniMax M2.7', badges: ['EP2'], params: '229B (10B active)', quant: 'NVFP4', arch: 'Attention + MoE', tps: '~15 tok/s' },
   { name: 'Qwen3.5-27B', badges: [], params: '27B (dense)', quant: 'NVFP4', arch: 'GDN + Attention (Dense)', tps: '~15 tok/s' },
   { name: 'Qwen3-Next-80B-A3B', badges: ['MTP'], params: '80B (3B active)', quant: 'NVFP4', arch: 'SSM + Attention + MoE', tps: '~87 tok/s' },
   { name: 'Qwen3-Coder-Next', badges: ['FP8'], params: '80B (3B active)', quant: 'FP8', arch: 'SSM + Attention + MoE', tps: '~45 tok/s' },
   { name: 'Qwen3-VL-30B', badges: [], params: '30B (3B active)', quant: 'NVFP4', arch: 'Attention + MoE (Vision)', tps: '~68 tok/s' },
+  { name: 'MiniMax M2.7', badges: ['EP2'], params: '229B (10B active)', quant: 'NVFP4', arch: 'Attention + MoE', tps: '~15 tok/s' },
   { name: 'Gemma 4 31B', badges: [], params: '31B (dense)', quant: 'NVFP4', arch: 'Dense Transformer', tps: '~11 tok/s' },
   { name: 'Gemma 4 26B', badges: [], params: '26B (3.8B active)', quant: 'NVFP4', arch: 'MoE (128 experts, top-8)', tps: '~73 tok/s' },
   { name: 'Nemotron-3 Super 120B', badges: ['FP8'], params: '120B (12B active)', quant: 'NVFP4 / FP8', arch: 'Mamba-2 + MoE', tps: '~27 tok/s' },
@@ -153,22 +154,21 @@ export const testimonials = [
   }
 ];
 
-// Hero shows the install step (pull). TryIt below shows pull + full run.
-export const quickInstall = `docker pull avarok/atlas-gb10:latest`;
+// Hero shows the install step. TryIt below shows install + run.
+// sparkrun pulls & runs the avarok/atlas-gb10:latest image for you
+// (the recipe declares `container:`); it uses an existing Docker/Podman
+// + NVIDIA container runtime — it does not install the container engine.
+export const quickInstall = `uvx sparkrun setup install`;
 
-export const dockerCommand = `docker pull avarok/atlas-gb10:latest
+// The command users see and copy: curl the static quickstart script and pipe
+// it to sh. The script (static/quickstart.sh, served at /quickstart.sh) checks
+// whether sparkrun is already installed before installing it via uvx, then
+// runs the default recipe. The raw equivalent is kept below for reference.
+export const runCommand = 'curl -fsSL https://atlasinference.io/quickstart.sh | sh';
+// What the script does, spelled out (not shown in the terminal card).
+export const runCommandRaw =
+  'uvx sparkrun setup install && sparkrun run @atlas/qwen3.6-35b-a3b-fp8-mtp --hosts localhost';
 
-sudo docker run -d --name atlas \\
-  --network host --gpus all --ipc=host \\
-  -v ~/.cache/huggingface:/root/.cache/huggingface \\
-  avarok/atlas-gb10:latest \\
-  serve Qwen/Qwen3.6-35B-A3B-FP8 \\
-    --port 8888 \\
-    --max-seq-len 65536 \\
-    --kv-cache-dtype fp8 \\
-    --kv-high-precision-layers auto \\
-    --gpu-memory-utilization 0.90 \\
-    --scheduling-policy slai \\
-    --tool-call-parser qwen3_coder \\
-    --enable-prefix-caching \\
-    --speculative`;
+// X / Twitter handle for Atlas.
+export const xHandle = '@atlasinference';
+export const xUrl = 'https://x.com/atlasinference';

@@ -5,6 +5,19 @@
 use super::*;
 
 impl MoeLayer {
+    /// True when the ATLAS_FP32_ROUTING path is active: the SSM-side MoE-input
+    /// norm should emit an FP32 `router_in` (residual_add_rms_norm_gatef32) which
+    /// the gate GEMM then consumes at full precision. Requires the f32 kernels to
+    /// be present and the softmax-routed dense-gate config (NVFP4 gate / sigmoid+bias
+    /// stay BF16). Default off → BF16 routing unchanged.
+    pub fn fp32_routing_active(&self) -> bool {
+        self.gate_nvfp4.is_none()
+            && self.correction_bias_dev.is_none()
+            && self.dense_gemm_f32in.0 != 0
+            && self.moe_topk_f32.0 != 0
+            && std::env::var("ATLAS_FP32_ROUTING").as_deref() == Ok("1")
+    }
+
     /// Forward pass: gate → top-K routing → batched expert FFN → blend.
     ///
     /// All expert dispatch stays on device — zero D2H synchronization.
@@ -111,27 +124,70 @@ impl MoeLayer {
             })?;
 
             prof!("topk", {
-                if let Some(bias) = self.correction_bias_dev {
-                    // DeepSeek-V3 / MiniMax-M2 sigmoid + correction bias:
-                    //   scores   = sigmoid(gate_logits)
-                    //   indices  = topk(scores + bias)
-                    //   weights  = scores[indices] / sum(scores[indices])
-                    // Kernel does all three steps; norm_topk_prob toggles
-                    // the final divide, scaling_factor = 1.0 (MiniMax has
-                    // no routed_scaling_factor, unlike Nemotron-H's 2.5).
-                    ops::moe_topk_sigmoid(
+                if let Some(tid2eid) = self.tid2eid_dev {
+                    // DeepSeek-V4 hash routing (hash_moe layer): expert SELECTION
+                    // is the static `tid2eid[token_id]` table; the learned gate
+                    // still supplies the sqrtsoftplus scores that weight them.
+                    let token_ids = ctx.token_ids.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "DeepSeek-V4 hash-MoE layer requires ForwardContext.token_ids (decode)"
+                        )
+                    })?;
+                    ops::moe_hash_route(
                         ctx.gpu,
-                        self.moe_topk_sigmoid_k,
+                        self.moe_hash_route_k,
                         gate_logits,
-                        bias,
+                        tid2eid,
+                        token_ids, // decode: single token at offset 0
                         indices_dev,
                         weights_dev,
                         num_experts,
                         top_k,
                         ctx.config.norm_topk_prob,
-                        1.0,
+                        ctx.config.routed_scaling_factor as f32,
                         stream,
                     )
+                } else if let Some(bias) = self.correction_bias_dev {
+                    if ctx.config.scoring_func == "sqrtsoftplus" {
+                        // DeepSeek-V4 sqrtsoftplus + correction bias:
+                        //   scores   = sqrtsoftplus(gate_logits)
+                        //   indices  = topk(scores + bias)
+                        //   weights  = scores[indices] / sum(scores[indices])
+                        ops::moe_topk_sqrtsoftplus(
+                            ctx.gpu,
+                            self.moe_topk_sqrtsoftplus_k,
+                            gate_logits,
+                            bias,
+                            indices_dev,
+                            weights_dev,
+                            num_experts,
+                            top_k,
+                            ctx.config.norm_topk_prob,
+                            ctx.config.routed_scaling_factor as f32,
+                            stream,
+                        )
+                    } else {
+                        // DeepSeek-V3 / MiniMax-M2 sigmoid + correction bias:
+                        //   scores   = sigmoid(gate_logits)
+                        //   indices  = topk(scores + bias)
+                        //   weights  = scores[indices] / sum(scores[indices])
+                        // Kernel does all three steps; norm_topk_prob toggles
+                        // the final divide. scaling_factor comes from the model
+                        // config (e.g., Step 3.7 = 3.0, MiniMax M2 = 1.0).
+                        ops::moe_topk_sigmoid(
+                            ctx.gpu,
+                            self.moe_topk_sigmoid_k,
+                            gate_logits,
+                            bias,
+                            indices_dev,
+                            weights_dev,
+                            num_experts,
+                            top_k,
+                            ctx.config.norm_topk_prob,
+                            ctx.config.routed_scaling_factor as f32,
+                            stream,
+                        )
+                    }
                 } else {
                     ops::moe_topk_softmax(
                         ctx.gpu,
@@ -148,7 +204,7 @@ impl MoeLayer {
             })?;
         }
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
             ctx.gpu.synchronize(stream)?;
             // Read expert indices (u32[top_k]) and weights (f32[top_k])
             let k = top_k as usize;
@@ -206,13 +262,64 @@ impl MoeLayer {
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();
-        // Use logits buffer for shared expert gate scratch (ssm_ba is too small:
-        // 128 bytes vs shared_inter * 2 = 1024 bytes needed).
+        // ⚠ `logits` aliased as shared-gate scratch — concurrent users
+        // MUST offset past `shared_expert_intermediate_size * 2`
+        // (decode_b.rs:197 uses .offset(65536)). See bug 2 in memory
+        // `project_batch_decode_corruption.md` (2026-05-10).
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
         let shared_out = ctx.buffers.attn_output();
 
-        if let (Some(gp), Some(up), Some(dp), Some(sh)) = (
+        if let (Some(gp), Some(up), Some(dp), Some(sg), Some(su), Some(sd)) = (
+            self.bf16_gate_weight_ptrs,
+            self.bf16_up_weight_ptrs,
+            self.bf16_down_weight_ptrs,
+            self.bf16_shared_gate,
+            self.bf16_shared_up,
+            self.bf16_shared_down,
+        ) {
+            // BF16 path: FP8-dequant-on-load. Eliminates the per-layer 0.989
+            // FP8 cosine ceiling by serving experts as BF16 end-to-end.
+            prof!("exp_gate_up_bf16", {
+                ops::moe_expert_gate_up_shared_bf16(
+                    ctx.gpu,
+                    self.moe_expert_gate_up_shared_bf16_k,
+                    expert_input,
+                    gp,
+                    expert_gate_out,
+                    up,
+                    expert_up_out,
+                    indices_dev,
+                    sg,
+                    shared_gate_scratch,
+                    su,
+                    shared_up_scratch,
+                    inter,
+                    h,
+                    top_k,
+                    stream,
+                )
+            })?;
+            prof!("exp_silu_down_bf16", {
+                ops::moe_expert_silu_down_shared_bf16(
+                    ctx.gpu,
+                    self.moe_expert_silu_down_shared_bf16_k,
+                    expert_gate_out,
+                    expert_up_out,
+                    dp,
+                    expert_down_out,
+                    indices_dev,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    sd,
+                    shared_out,
+                    h,
+                    inter,
+                    top_k,
+                    stream,
+                )
+            })?;
+        } else if let (Some(gp), Some(up), Some(dp), Some(sh)) = (
             &self.fp8_gate_weight_ptrs,
             &self.fp8_up_weight_ptrs,
             &self.fp8_down_weight_ptrs,
@@ -308,7 +415,7 @@ impl MoeLayer {
                 )
             })?;
 
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
                 ctx.gpu.synchronize(stream)?;
                 // Dump gate/up outputs for expert slot 0
                 let mut gate_buf = vec![0u8; 16];
@@ -374,7 +481,7 @@ impl MoeLayer {
             })?;
         }
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
             ctx.gpu.synchronize(stream)?;
             // Dump down outputs for expert slot 0
             let mut down_buf = vec![0u8; 16];
@@ -470,7 +577,7 @@ impl MoeLayer {
             }
         }
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
             ctx.gpu.synchronize(stream)?;
             let mut buf = vec![0u8; 8];
             ctx.gpu.copy_d2h(output, &mut buf)?;

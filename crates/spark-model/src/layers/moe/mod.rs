@@ -11,7 +11,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layer::ForwardContext;
 use crate::layers::ops;
-use crate::weight_map::{ExpertWeight, Fp8ExpertWeight, Fp8Weight, MoeWeights, QuantizedWeight};
+use crate::weight_map::{
+    DenseWeight, ExpertWeight, Fp8ExpertWeight, Fp8Weight, MoeWeights, QuantizedWeight,
+};
 
 /// Device-side pointer table for one projection across all experts.
 ///
@@ -19,11 +21,11 @@ use crate::weight_map::{ExpertWeight, Fp8ExpertWeight, Fp8Weight, MoeWeights, Qu
 /// expert_id from device memory, then indexes these tables to find
 /// the correct weight pointers — no CPU involvement needed.
 pub(crate) struct ExpertPtrTable {
-    /// [num_experts] u64 device pointers to each expert's B_packed.
+    /// `[num_experts]` u64 device pointers to each expert's B_packed.
     pub(crate) packed_ptrs: DevicePtr,
-    /// [num_experts] u64 device pointers to each expert's B_scale.
+    /// `[num_experts]` u64 device pointers to each expert's B_scale.
     pub(crate) scale_ptrs: DevicePtr,
-    /// [num_experts] f32 per-expert scale2 values.
+    /// `[num_experts]` f32 per-expert scale2 values.
     pub(crate) scale2_vals: DevicePtr,
 }
 
@@ -33,9 +35,9 @@ pub(crate) struct ExpertPtrTable {
 /// NVFP4's 3 (packed + scale + scale2). The fused FP8 MoE kernel indexes
 /// these tables by expert_id to load the correct FP8 weight matrix.
 pub(crate) struct Fp8ExpertPtrTable {
-    /// [num_experts] u64 device pointers to each expert's FP8 weight.
+    /// `[num_experts]` u64 device pointers to each expert's FP8 weight.
     pub(crate) weight_ptrs: DevicePtr,
-    /// [num_experts] u64 device pointers to each expert's block scales.
+    /// `[num_experts]` u64 device pointers to each expert's block scales.
     pub(crate) scale_ptrs: DevicePtr,
 }
 
@@ -76,6 +78,13 @@ pub struct MoeLayer {
     w4a16_gemv: KernelHandle,
     w4a16_gemm: KernelHandle,
     dense_gemm: KernelHandle,
+    /// FP32-output router GEMM + FP32-input top-K for the ATLAS_FP32_GATE path.
+    /// Zero (unresolved) when the kernels are absent; dispatch falls back to BF16.
+    dense_gemm_f32out: KernelHandle,
+    /// FP32-in/FP32-out router GEMM for ATLAS_FP32_ROUTING (reads the FP32
+    /// router_in from residual_add_rms_norm_gatef32). Zero if absent.
+    dense_gemm_f32in: KernelHandle,
+    moe_topk_f32: KernelHandle,
     moe_expert_gate_up_shared: KernelHandle,
     moe_expert_silu_down_shared: KernelHandle,
     moe_topk: KernelHandle,
@@ -134,6 +143,17 @@ pub struct MoeLayer {
     // the weight loader produces transposed-only pointer tables.
     moe_expert_gate_up_shared_t_k: KernelHandle,
     moe_expert_silu_down_shared_t_k: KernelHandle,
+    // ── sqrtsoftplus routing (DeepSeek-V4) ──
+    moe_topk_sqrtsoftplus_k: KernelHandle,
+    moe_topk_sqrtsoftplus_batched_k: KernelHandle,
+    // ── hash routing (DeepSeek-V4 first `num_hash_layers` MoE layers) ──
+    moe_hash_route_k: KernelHandle,
+    moe_hash_route_batched_k: KernelHandle,
+    /// Static `tid2eid` table [vocab_size, top_k] i64 — present ONLY for the
+    /// hash-routed layers (the loader supplies it only for those). `Some`
+    /// here is the SSOT that this layer routes via the static hash table
+    /// instead of the learned gate's top-K.
+    tid2eid_dev: Option<DevicePtr>,
     moe_expert_gate_up_shared_batch2_t_k: KernelHandle,
     moe_expert_silu_down_shared_batch2_t_k: KernelHandle,
     moe_expert_gate_up_shared_batch3_t_k: KernelHandle,
@@ -218,21 +238,50 @@ pub struct MoeLayer {
     moe_expert_gate_up_shared_fp8_batch3: KernelHandle,
     moe_expert_silu_down_shared_fp8_batch3: KernelHandle,
     moe_weighted_sum_blend_fp8_batch3: KernelHandle,
-    // FP8 grouped GEMM for sorted MoE prefill
+    // THE routed-expert FP8 grouped GEMM for sorted MoE prefill: grid-compaction
+    // (persistent 96-CTA grid over a COMPACTED (expert, m_tile, n_tile) work-list
+    // built by `moe_build_tile_worklist`). Handle may be 0 on images that don't
+    // ship the kernel.
     moe_fp8_grouped_gemm_k: KernelHandle,
-    // FP8 grouped GEMM v2 — coalesced B/A load thread-remap. Opt-in via
-    // ATLAS_FP8_MOE_COALESCED=1 env var. Kernel handle may be 0 on older
-    // images (then dispatch falls back to v1). Same signature as v1.
-    moe_fp8_grouped_gemm_v2_k: KernelHandle,
-    // Resolved once per layer from ATLAS_FP8_MOE_COALESCED env var.
-    fp8_moe_coalesced_enabled: bool,
-    w8a16_gemm_k: KernelHandle, // for shared expert FP8 prefill
+    // Builds the grouped-GEMM work-list (moe_build_tile_worklist, module "moe").
+    // Launched on the SAME stream as the grouped GEMM (read-after-write of
+    // total_tiles). Handle may be 0 on older images.
+    moe_build_tile_worklist_k: KernelHandle,
+    // W8A8 + FP32 epilogue MoE GEMM (vLLM-equivalent). Opt-in via
+    // ATLAS_FP8_W8A8=1. Requires per-token-quanted A_fp8 + a_scale.
+    moe_w8a8_grouped_gemm_k: KernelHandle,
+    per_token_group_quant_fp8_k: KernelHandle,
+    // Dense W8A8 (same kernel used by attention QKV/O proj) for shared-expert path.
+    fp8_gemm_t_blockscaled_k: KernelHandle,
+    // BF16 grouped GEMM — for FP8-source models dequanted to BF16 at load.
+    // Activates the high-precision MoE path that closes the per-layer
+    // 0.989 FP8 cosine ceiling. Handle may be 0 on images that don't ship
+    // the kernel; dispatch site is gated on Some(bf16_*_weight_ptrs).
+    moe_bf16_grouped_gemm_k: KernelHandle,
+    // Fused BF16 decode kernels (mirror moe_expert_*_shared_fp8 layout).
+    moe_expert_gate_up_shared_bf16_k: KernelHandle,
+    moe_expert_silu_down_shared_bf16_k: KernelHandle,
+    w8a16_gemm_k: KernelHandle,           // for shared expert FP8 prefill
+    w8a16_gemm_pipelined_k: KernelHandle, // ATLAS_W8A16_PIPELINED shared-expert variant
     // Fused gate GEMV + topK softmax (saves 1 kernel launch per layer)
     moe_gate_topk_fused_k: KernelHandle,
     // FP8 expert pointer tables (None when experts are NVFP4)
     fp8_gate_weight_ptrs: Option<Fp8ExpertPtrTable>,
     fp8_up_weight_ptrs: Option<Fp8ExpertPtrTable>,
     fp8_down_weight_ptrs: Option<Fp8ExpertPtrTable>,
+    // BF16 expert pointer tables — populated by the FP8-dequant-on-load
+    // path. When Some, the routed-expert dispatch in `forward_prefill_fp8`
+    // routes through `moe_bf16_grouped_gemm` instead of the FP8 grouped
+    // GEMM, eliminating the per-layer FP8 quantization ceiling.
+    bf16_gate_weight_ptrs: Option<DevicePtr>,
+    bf16_up_weight_ptrs: Option<DevicePtr>,
+    bf16_down_weight_ptrs: Option<DevicePtr>,
+    // BF16 shared expert weights — direct device pointers for the
+    // fused-decode dispatch. Mirrors `fp8_shared_expert` but with raw
+    // BF16 pointers (no scale).
+    bf16_shared_gate: Option<DevicePtr>,
+    bf16_shared_up: Option<DevicePtr>,
+    bf16_shared_down: Option<DevicePtr>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     fp8_shared_expert: Option<Fp8ExpertWeight>,
     // Phase 2.7 Tier C — Frankenstein dispatch flag.
@@ -247,6 +296,7 @@ pub struct MoeLayer {
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod dump;
 mod forward;
 mod forward_batched;
 mod forward_ep;
@@ -254,8 +304,10 @@ mod forward_k2;
 mod forward_k3;
 mod forward_phase;
 mod forward_prefill;
+mod forward_prefill_bf16;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
+mod forward_prefill_routed;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
@@ -337,6 +389,23 @@ fn build_ptr_table(
 ///
 /// FP8 experts store 2 arrays (weight + block_scale) per projection,
 /// vs NVFP4's 3 (packed + scale + scale2).
+/// Build a device-side BF16 pointer table for one projection across all
+/// experts. Used by the FP8-dequant-to-BF16 MoE path; one device pointer
+/// per expert pointing at that expert's `[N, K]` BF16 weight buffer.
+pub(crate) fn build_bf16_ptr_table(
+    experts: &[DenseWeight],
+    gpu: &dyn GpuBackend,
+) -> Result<DevicePtr> {
+    let n = experts.len();
+    let weight_bytes: Vec<u8> = experts
+        .iter()
+        .flat_map(|e| e.weight.0.to_le_bytes())
+        .collect();
+    let ptrs = gpu.alloc(n * 8)?;
+    gpu.copy_h2d(&weight_bytes, ptrs)?;
+    Ok(ptrs)
+}
+
 fn build_fp8_ptr_table(
     experts: &[Fp8ExpertWeight],
     proj: impl Fn(&Fp8ExpertWeight) -> &Fp8Weight,

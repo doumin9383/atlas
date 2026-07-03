@@ -3,15 +3,46 @@
 //! `Qwen3AttentionLayer` setters and small per-layer compute helpers
 //! (`apply_layer_scalar`, `effective_attn_scale`).
 
-use super::types::{MlaWeights, Qwen3AttentionLayer};
+use super::types::{HcWeights, MlaWeights, Qwen3AttentionLayer};
 use crate::layers::FfnComponent;
 use crate::weight_map::DenseWeight;
+
+/// YaRN attention-temperature factor for a single `mscale` value.
+/// Matches HF `yarn_get_mscale`: `0.1 * mscale * ln(scale) + 1.0` for
+/// `scale > 1`, else `1.0`.
+fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
+    if scale <= 1.0 {
+        1.0
+    } else {
+        0.1 * mscale * scale.ln() + 1.0
+    }
+}
+
+/// Compute the YaRN `_mscale` ratio that DeepSeek folds into the rope
+/// cos/sin: `get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)`.
+/// Returns 1.0 when YaRN is disabled (`yarn_factor <= 1`).
+pub(crate) fn yarn_rope_mscale(config: &atlas_core::config::ModelConfig) -> f32 {
+    let factor = config.yarn_factor;
+    if factor <= 1.0 {
+        return 1.0;
+    }
+    let num = yarn_get_mscale(factor, config.yarn_mscale);
+    let den = yarn_get_mscale(factor, config.yarn_mscale_all_dim);
+    num / den
+}
 
 impl Qwen3AttentionLayer {
     /// Set MLA weights for 2-step latent decode. When set, decode uses
     /// latent→norm→expand instead of single-step GEMV.
     pub fn set_mla_weights(&mut self, mla: MlaWeights) {
         self.mla = Some(mla);
+    }
+
+    /// Set per-block Manifold-Constrained Hyper-Connection weights
+    /// (DeepSeek-V4). When set, the attn/ffn residual sites route through
+    /// `hc_pre`/`hc_post` against the model-level `hc_streams` buffer.
+    pub fn set_hc_weights(&mut self, hc: HcWeights) {
+        self.hc = Some(hc);
     }
 
     /// Set per-layer dimension overrides for heterogeneous models (Gemma-4).
@@ -33,6 +64,12 @@ impl Qwen3AttentionLayer {
     /// full-attention layers. Non-Gemma-4 models never call this.
     pub fn set_sliding_window(&mut self, window: Option<u32>) {
         self.sliding_window = window;
+    }
+
+    /// Set per-head attention gate weight (Step 3.7 g_proj).
+    /// The weight is BF16 shape [num_q_heads, hidden_size].
+    pub fn set_head_gate_weight(&mut self, w: DenseWeight) {
+        self.head_gate_weight = Some(w);
     }
 
     /// Set per-layer RoPE overrides (theta, rotary_dim) for dual-RoPE
@@ -117,11 +154,7 @@ impl Qwen3AttentionLayer {
     }
 
     /// Apply layer_scalar in-place: `hidden *= scalar`. Uses
-    /// `bf16_scale_inplace` for BF16 buffers, or `f32_scale_inplace`
-    /// when the FP32 residual path is active (Gemma-4). Gemma-4's
-    /// layer_scalar values are small (L0=0.09, L1=0.065) so the BF16
-    /// variant compounds underflow across layers — the FP32 path is a
-    /// correctness requirement for 31B.
+    /// `bf16_scale_inplace` for the (always BF16) residual stream.
     pub(crate) fn apply_layer_scalar(
         &self,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
@@ -129,14 +162,9 @@ impl Qwen3AttentionLayer {
         hidden_size: usize,
         scalar: f32,
         stream: u64,
-        fp32_residual: bool,
     ) -> anyhow::Result<()> {
         use spark_runtime::kernel_args::KernelLaunch;
-        let scale_k = if fp32_residual {
-            gpu.kernel("embed_scale", "f32_scale_inplace")?
-        } else {
-            gpu.kernel("embed_scale", "bf16_scale_inplace")?
-        };
+        let scale_k = gpu.kernel("embed_scale", "bf16_scale_inplace")?;
         let n = hidden_size as u32;
         KernelLaunch::new(gpu, scale_k)
             .grid([n.div_ceil(256), 1, 1])

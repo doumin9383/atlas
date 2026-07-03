@@ -5,19 +5,6 @@
 use super::*;
 
 impl MoeLayer {
-    /// Pick the FP8 grouped GEMM kernel handle — v2 (coalesced thread remap)
-    /// when ATLAS_FP8_MOE_COALESCED=1 and the v2 kernel is linked into the
-    /// image; v1 otherwise. v1 is the validated default path so any image
-    /// that predates the v2 kernel silently stays on the correct behaviour.
-    #[inline]
-    pub(super) fn fp8_grouped_kernel(&self) -> KernelHandle {
-        if self.fp8_moe_coalesced_enabled && self.moe_fp8_grouped_gemm_v2_k.0 != 0 {
-            self.moe_fp8_grouped_gemm_v2_k
-        } else {
-            self.moe_fp8_grouped_gemm_k
-        }
-    }
-
     /// Transpose MoE weights for coalesced prefill GEMM reads.
     ///
     /// Transposes per-expert routed weights [N, K/2] → [K/2, N] to enable

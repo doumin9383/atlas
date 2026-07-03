@@ -14,7 +14,7 @@ use super::super::super::types::TransformerModel;
 use crate::traits::SequenceState;
 
 impl TransformerModel {
-    pub(super) fn prefill_b_save_checkpoint(
+    pub(in crate::model) fn prefill_b_save_checkpoint(
         &self,
         tokens: &[u32],
         seq: &mut SequenceState,
@@ -31,6 +31,27 @@ impl TransformerModel {
         let end_block = end_token / bs;
         if end_block == 0 || !end_block.is_multiple_of(self.ssm_checkpoint_interval) {
             return Ok(());
+        }
+        // Stale-V cap (mirrors finalize_last): never checkpoint-cache a block
+        // past the contiguous fully-written-KV prefix. If this boundary's
+        // blocks aren't all KV-valid yet, skip the intermediate insert rather
+        // than cache stale V.
+        if seq.kv_valid_tokens / bs < end_block {
+            tracing::debug!(
+                "Skip intermediate checkpoint at block {end_block}: \
+                 kv_valid_tokens={} only covers {} complete blocks",
+                seq.kv_valid_tokens,
+                seq.kv_valid_tokens / bs,
+            );
+            return Ok(());
+        }
+        if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
+            self.ssm_pool.debug_state_checksum(
+                seq.slot_idx,
+                self.gpu.as_ref(),
+                stream,
+                &format!("ckpt_save@{end_token}"),
+            );
         }
 
         let snap_result = match self.ssm_snapshots.save(

@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#[allow(unused_imports)]
-use serde::{Deserialize, Serialize};
-
-#[allow(unused_imports)]
-use super::*;
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct IncomingMessage {
@@ -20,6 +16,16 @@ pub struct IncomingMessage {
     /// Function name for tool response messages.
     #[serde(default)]
     pub name: Option<String>,
+    /// Historical reasoning trace from a prior assistant turn (Qwen3
+    /// `<think>...</think>` body). Clients (vLLM/SGLang/opencode) round-trip
+    /// this field so the chat template can rehydrate the historical
+    /// `<think>` block. Without it the template emits empty
+    /// `<think>\n\n</think>\n\n` wrappers for every historical assistant
+    /// turn → empty-think poisoning → premature `<|im_end|>` abort.
+    /// Accepts both `reasoning_content` (DeepSeek/vLLM/LiteLLM standard)
+    /// and the shorter `reasoning` alias used by some OpenAI SDK versions.
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_content: Option<String>,
 }
 
 /// Content extracted from a message — text and any base64-encoded images.
@@ -43,6 +49,7 @@ impl IncomingMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -58,6 +65,7 @@ impl IncomingMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -72,11 +80,16 @@ impl IncomingMessage {
             .unwrap_or("message");
         match kind {
             "message" => {
-                let role = obj
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("user")
-                    .to_string();
+                let role = match obj.get("role").and_then(|r| r.as_str()).unwrap_or("user") {
+                    // OpenAI Responses API may use `developer`, but most
+                    // model chat templates only understand system/user/assistant/tool.
+                    // Map `developer` to `user` instead of `system`, because some
+                    // templates require system messages to appear only at the beginning
+                    // of the conversation.
+                    "developer" => "user",
+                    other => other,
+                }
+                .to_string();
                 let content_val = obj.get("content")?;
                 let mut text = String::new();
                 match content_val {
@@ -105,6 +118,7 @@ impl IncomingMessage {
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                    reasoning_content: None,
                 })
             }
             // Replay of a prior assistant function_call in the input chain.
@@ -134,6 +148,7 @@ impl IncomingMessage {
                     }]),
                     tool_call_id: None,
                     name: None,
+                    reasoning_content: None,
                 })
             }
             // Tool-execution result the client sends back so the model
@@ -165,6 +180,7 @@ impl IncomingMessage {
                     tool_calls: None,
                     tool_call_id: Some(call_id),
                     name: if name.is_empty() { None } else { Some(name) },
+                    reasoning_content: None,
                 })
             }
             // Reasoning items (Responses-API `type:"reasoning"`) are

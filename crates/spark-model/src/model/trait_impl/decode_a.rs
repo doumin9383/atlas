@@ -41,12 +41,46 @@ impl TransformerModel {
 
         let mut kv_cache = self.kv_cache.lock();
 
+        // CBD probe: at the FIRST decode step (seq_len still == prompt_len,
+        // before this token is appended) checksum every reusable scratch
+        // buffer + per-slot SSM state BEFORE any compute. On the prefix-cache
+        // skip path a buffer that the cold full-prefill writes but the skip
+        // path bypasses will show (a) a different fingerprint cold-vs-ON or
+        // (b) a different fingerprint between two ON runs (leftover from the
+        // prior pool occupant) — that is the stale-scratch culprit.
+        if seq.seq_len == seq.prompt_len && std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
+            self.buffers
+                .debug_buffer_checksum(self.gpu.as_ref(), stream, "decode_step0_pre");
+            self.ssm_pool.debug_state_checksum(
+                seq.slot_idx,
+                self.gpu.as_ref(),
+                stream,
+                "decode_step0_pre",
+            );
+            // Per-block KV fingerprint over the WHOLE block table for the
+            // first attention layer (idx 0 = L3) — the layer where the
+            // per-layer hidden first diverges. Compares on1-vs-on2 to pin the
+            // physical block whose K/V the skip path left stale.
+            kv_cache.debug_kv_per_block(
+                0,
+                &seq.block_table,
+                self.gpu.as_ref(),
+                stream,
+                "decode_step0_pre",
+            );
+        }
+
         // ── Phase 1: Operations OUTSIDE graph (vary per token) ──
 
         // MLA models: zero buffers reused for Q_absorbed computation.
         // Without this, stale prefill data in expert_up_out / ssm_conv_out_f32 /
-        // ssm_ba contaminates the absorbed attention → generic/wrong output.
-        if self.config.kv_lora_rank > 0 {
+        // ssm_ba contaminates the ABSORBED attention → generic/wrong output.
+        // DeepSeek-V4-Flash (o_lora_rank > 0) uses the DIRECT V=K attention path
+        // (not absorbed) and writes-before-reads those scratch buffers, so the
+        // full-arena zero (~1.7GB memset/step, sized for max prefill tokens) is
+        // unnecessary — skip it for V4 to reclaim that decode-step memset
+        // bandwidth. (Other MLA models keep the zero.)
+        if self.config.kv_lora_rank > 0 && self.config.o_lora_rank == 0 {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
         }
 
@@ -89,6 +123,12 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
 
+        // Upload the decode token ID into the STABLE token_ids buffer (uploaded
+        // every step, BEFORE any CUDA-graph replay, so DeepSeek-V4 hash-MoE
+        // layers read the correct `tid2eid[token_id]`). Single token at offset 0.
+        self.gpu
+            .copy_h2d_async(&token.to_le_bytes(), self.buffers.token_ids(), stream)?;
+
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
             positions_h: meta_base,
@@ -119,12 +159,24 @@ impl TransformerModel {
         // Capture isn't a useful win for HSS anyway: per-layer launch overhead
         // is small relative to the per-step disk I/O on the critical path.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
-        let use_graphs = self.comm.is_none()
+        // CBD: run the FIRST decode step eagerly when dumping so per-layer
+        // probes can sync (illegal under graph capture). Subsequent steps
+        // still capture/replay normally.
+        let dump_step0 =
+            seq.seq_len == seq.prompt_len && std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok();
+        // EXPERIMENT (ATLAS_EP_GRAPHS=1): allow CUDA-graph capture under EP. The
+        // EP all-reduce queues ncclSend/Recv + local-add on the compute (capture)
+        // stream; NCCL ≥2.9 supports graph capture, so this MAY capture cleanly
+        // and remove per-kernel launch overhead. Env-gated so it can be toggled
+        // off at deploy time (instant revert) if capture crashes / replay hangs.
+        let ep_graphs = std::env::var("ATLAS_EP_GRAPHS").is_ok_and(|v| v == "1" || v == "true");
+        let use_graphs = (self.comm.is_none() || ep_graphs)
             && !self.profile
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
-            && !hss_engaged;
+            && !hss_engaged
+            && !dump_step0;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -134,6 +186,10 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            gdn_exact_replay: false,
+            // Hash-MoE: the single decode token ID (uploaded above every step
+            // before graph replay). MoE reads it at offset 0.
+            token_ids: Some(self.buffers.token_ids()),
         };
 
         // Profile mode: use per-layer sync decode for timing breakdown.
@@ -175,6 +231,9 @@ impl TransformerModel {
             self.gpu.begin_capture(stream)?;
         }
 
+        let probe_layers = !use_graphs
+            && seq.seq_len == seq.prompt_len
+            && std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok();
         for (i, layer) in self.layers.iter().enumerate() {
             layer.decode(
                 hidden,
@@ -188,6 +247,24 @@ impl TransformerModel {
                 &ctx,
                 stream,
             )?;
+            // CBD per-layer hidden fingerprint at decode step 0 (eager only).
+            // Localizes the FIRST layer whose post-layer hidden diverges
+            // cold-vs-ON / ON-vs-ON → pins the bug to that layer's read set.
+            if probe_layers {
+                self.gpu.synchronize(stream).ok();
+                let mut hb = vec![0u8; self.config.hidden_size * 2];
+                if self.gpu.copy_d2h(hidden, &mut hb).is_ok() {
+                    let mut s = 0f64;
+                    for c in hb.chunks_exact(2) {
+                        let bits = u16::from_le_bytes([c[0], c[1]]);
+                        let v = f32::from_bits((bits as u32) << 16) as f64;
+                        if v.is_finite() {
+                            s += v.abs();
+                        }
+                    }
+                    tracing::warn!("ATLAS_LAYER_H[step0] L{i} hidden_sabs={s:.6}");
+                }
+            }
             // DFlash 5-layer hidden capture (no-op when proposer is not DFlash).
             // Single-token decode: row 0 of `hidden_states()` holds the post-layer
             // activation. Cheap d2d when the layer index matches; otherwise a

@@ -14,7 +14,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{AttnMetadataDev, LayerState};
 use crate::speculative::DraftProposer;
-use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
+use crate::traits::{ChunkedPrefillPageMetadata, Model, PrefillSlice, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights};
 
 mod async_chkpt;
@@ -22,6 +22,7 @@ mod decode_a;
 mod decode_a2;
 mod decode_b;
 mod decode_b2;
+mod decode_checkpoint;
 mod ep_misc;
 mod meta;
 mod prefill_a;
@@ -96,6 +97,47 @@ impl Model for TransformerModel {
             stream,
         )
     }
+
+    /// Q12 Phase 4b override: try the model-level batched dispatch
+    /// (`prefill_batch_chunk_dispatch`) first; on the not-yet-implemented
+    /// stub failure, fall back to the trait's default per-stream loop.
+    /// This keeps callers correct while the per-layer-batched body is
+    /// staged in subsequent commits.
+    fn prefill_batch_chunk(
+        &self,
+        streams: &mut [PrefillSlice<'_>],
+        stream: u64,
+    ) -> Result<Vec<DevicePtr>> {
+        // Try the concrete dispatch. The Phase 4b stub returns Err for the
+        // "not-yet-implemented" path so we transparently downgrade to the
+        // single-stream-loop default impl. Once Phase 2b/3 land, the
+        // dispatch returns Ok with logits and this fallback becomes dead
+        // code that we can drop.
+        match self.prefill_batch_chunk_dispatch(streams, stream) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // Log at debug — under expected for this stub. Promotes to
+                // info if a real error is encountered (future Phase 4b body).
+                tracing::debug!(
+                    "prefill_batch_chunk_dispatch unavailable, falling back to \
+                     per-stream loop: {e}"
+                );
+                let mut out = Vec::with_capacity(streams.len());
+                for slice in streams.iter_mut() {
+                    let logits = self.prefill_chunk(
+                        slice.prompt_tokens,
+                        slice.seq,
+                        slice.chunk_start,
+                        slice.chunk_len,
+                        slice.is_last_chunk,
+                        stream,
+                    )?;
+                    out.push(logits);
+                }
+                Ok(out)
+            }
+        }
+    }
     fn vocab_size(&self) -> usize {
         self.vocab_size_dispatch()
     }
@@ -143,6 +185,22 @@ impl Model for TransformerModel {
     fn rollback_ssm_states(&self, seq: &mut SequenceState, num_accepted: usize) -> Result<()> {
         self.rollback_ssm_states_dispatch(seq, num_accepted)
     }
+    fn has_ssm_layers(&self) -> bool {
+        self.ssm_pool.num_ssm_layers > 0
+    }
+    fn decode_rollback_ring_slots(&self) -> usize {
+        if self.ssm_snapshots.decode_rollback_enabled() {
+            self.ssm_snapshots.decode_ring_slots
+        } else {
+            0
+        }
+    }
+    fn save_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
+        self.save_decode_ssm_snapshot_dispatch(seq, ring_slot)
+    }
+    fn restore_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
+        self.restore_decode_ssm_snapshot_dispatch(seq, ring_slot)
+    }
     fn generate_speculative(
         &self,
         prompt_tokens: &[u32],
@@ -162,6 +220,9 @@ impl Model for TransformerModel {
     }
     fn cache_sequence(&self, seq: &SequenceState) {
         self.cache_sequence_dispatch(seq)
+    }
+    fn decode_marconi_checkpoint(&self, seq: &mut SequenceState) {
+        self.decode_marconi_checkpoint_dispatch(seq)
     }
     fn free_sequence(&self, seq: &mut SequenceState) -> Result<()> {
         self.free_sequence_dispatch(seq)
@@ -242,6 +303,9 @@ impl Model for TransformerModel {
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
         self.compact_sequence_dispatch(seq, new_slot)
     }
+    fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
+        self.detach_slot_for_reuse_dispatch(seq)
+    }
     fn save_sequence_state(
         &self,
         seq: &SequenceState,
@@ -284,8 +348,16 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.commit_verify_state_async_dispatch(seq, num_accepted, k)
     }
-    fn ep_worker_step(&self, seq: &mut SequenceState) -> Result<bool> {
-        self.ep_worker_step_dispatch(seq)
+    fn commit_accepted_prefix(
+        &self,
+        seq: &mut SequenceState,
+        num_accepted: usize,
+        k: usize,
+    ) -> Result<()> {
+        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)
+    }
+    fn ep_worker_step(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
+        self.ep_worker_step_dispatch(slots)
     }
     fn is_ep(&self) -> bool {
         self.is_ep_dispatch()
@@ -304,6 +376,14 @@ impl Model for TransformerModel {
     fn ep_broadcast_cmd(&self, cmd: u32) -> Result<()> {
         self.ep_broadcast_cmd_dispatch(cmd)
     }
+    fn ep_broadcast_cmd_for_seq(&self, seq_id: u32, cmd: u32) -> Result<()> {
+        // Routes to the helper added in 21e2130. Behaviour depends on the
+        // ep_protocol_v2 field set at construction from ATLAS_EP_PROTOCOL.
+        self.ep_broadcast_seq_and_cmd(seq_id, cmd, self.ep_protocol_v2)
+    }
+    fn ep_protocol_v2(&self) -> bool {
+        self.ep_protocol_v2
+    }
     fn ep_broadcast_tokens(&self, tokens: &[u32]) -> Result<Vec<u32>> {
         self.ep_broadcast_tokens_dispatch(tokens)
     }
@@ -321,5 +401,8 @@ impl Model for TransformerModel {
     }
     fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
         self.stream_wait_event_dispatch(stream, event)
+    }
+    fn synchronize(&self, stream: u64) -> Result<()> {
+        self.synchronize_dispatch(stream)
     }
 }

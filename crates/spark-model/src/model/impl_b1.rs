@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-
 #![allow(unused_imports, dead_code)]
 
 use parking_lot::Mutex;
@@ -127,7 +126,7 @@ impl TransformerModel {
 
     /// Upload batch metadata to a caller-specified device address.
     ///
-    /// Same layout as [`upload_batch_metadata_fixed`] (positions at +0, slots
+    /// Same layout as `upload_batch_metadata_fixed` (positions at +0, slots
     /// at +256, seq_lens at +512, block_table at +768) but writes to
     /// `meta_base` instead of the hardcoded `scratch+32768`. Used by the
     /// fused `mixed_forward` to place decode metadata at a non-conflicting
@@ -225,7 +224,7 @@ impl TransformerModel {
         Ok((vals, norm))
     }
 
-    /// Read FP32 values from GPU memory (for FP32 residual stream diagnostics).
+    /// Read FP32 values from GPU memory (diagnostics).
     pub(super) fn readback_f32(&self, ptr: DevicePtr, n: usize) -> Result<(Vec<f32>, f32)> {
         let bytes = n * 4;
         let mut buf = vec![0u8; bytes];
@@ -272,6 +271,8 @@ impl TransformerModel {
                 profile: false,
                 comm: ctx.comm,
                 graph_capture: ctx.graph_capture,
+                gdn_exact_replay: false,
+                token_ids: None,
             }
 
         };
@@ -455,6 +456,8 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: false, // Eager mode — no CUDA graph
+            gdn_exact_replay: false,
+            token_ids: None,
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only

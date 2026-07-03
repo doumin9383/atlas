@@ -34,11 +34,8 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<()> {
         let h = self.config.hidden_size;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
+        // BF16 residual is the shipping config (2 bytes/element).
+        let elem_bytes = 2usize;
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
@@ -82,6 +79,12 @@ impl TransformerModel {
             profile: profile_now,
             comm: self.comm_ref(),
             graph_capture: false,
+            // Marconi warm hit: GDN layers replay from a restored SSM state
+            // and must use the bit-faithful WY4 recurrence (see layer.rs).
+            gdn_exact_replay: marconi_skip,
+            // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
+            // to the stable buffer, in chunk order matching the MoE loop).
+            token_ids: Some(self.buffers.token_ids()),
         };
 
         // When proc_count == 1 (warm prefix cache hit), use the decode layer path
@@ -89,7 +92,21 @@ impl TransformerModel {
         // and the decode MoE path, which is ~7x faster per layer than the prefill
         // GEMM path for a single token (0.7ms/layer vs 5ms/layer).
         let use_decode_path = proc_count == 1 && effective_seq_len_start > 0;
-        let layer_kv_write_start = if marconi_skip { 0 } else { kv_write_start };
+        // Marconi warm hit: this pass replays SSM state over [snap_tok,
+        // matched) — positions whose K/V already live in shared prefix-cache
+        // blocks. Pass the per-chunk count of those replay tokens as the
+        // layer write floor so attention layers do NOT rewrite them with
+        // non-bit-exact recomputed values (drift would poison the shared
+        // blocks and ratchet across turns). `seq.cached_prefix_tokens` is
+        // the radix-tree match point; tokens at or past it are new and are
+        // written normally.
+        let layer_kv_write_start = if marconi_skip {
+            seq.cached_prefix_tokens
+                .saturating_sub(effective_seq_len_start)
+                .min(proc_count)
+        } else {
+            kv_write_start
+        };
         let prefill_t0 = if profile_now {
             self.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -184,12 +201,37 @@ impl TransformerModel {
                 let (_, norm) = self.readback_bf16(hidden, self.config.hidden_size.min(64))?;
                 tracing::info!("L{i} hidden[0] norm={norm:.4}");
             }
+            // Per-layer numerical-divergence dump (env-gated, zero overhead when
+            // unset). `ATLAS_NEMO_DUMP=<dir>` writes the LAST token's full
+            // post-layer residual-stream hidden vector for every layer as
+            // headerless little-endian f32: `<dir>/atlas_L{i}.bin`. Overwrites
+            // on every call so the final chunk's last token wins (methodology
+            // §3 gotcha #5). Compared 1:1 against the HF CPU/GPU oracle.
+            if is_last_chunk
+                && let Ok(dir) = std::env::var("ATLAS_NEMO_DUMP")
+                && !dir.is_empty()
+            {
+                self.gpu.synchronize(stream)?;
+                let last_start = (proc_count - 1) * h;
+                let (vals, _) = self.readback_bf16(hidden.offset(last_start * elem_bytes), h)?;
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::create_dir_all(&dir).ok();
+                let path = std::path::Path::new(&dir).join(format!("atlas_L{i}.bin"));
+                std::fs::write(&path, &bytes).ok();
+                if i == self.layers.len() - 1 {
+                    tracing::info!(
+                        "ATLAS_NEMO_DUMP: wrote {} per-layer hidden \
+                         vectors ({h} f32 each) to {dir}",
+                        self.layers.len()
+                    );
+                }
+            }
             // Last-chunk diagnostic: log LAST token's hidden norm at every layer.
             if profile_now && is_last_chunk && proc_count > 1 && (chunk_start + chunk_len) > 16384 {
                 self.gpu.synchronize(stream)?;
                 let last_start = (proc_count - 1) * h;
                 let (vals, norm) =
-                    self.readback_bf16(hidden.offset(last_start * fp32), h.min(16))?;
+                    self.readback_bf16(hidden.offset(last_start * elem_bytes), h.min(16))?;
                 let lt = self.config.layer_type(i);
                 tracing::warn!(
                     "DIAG L{i} ({lt:?}) last_tok_norm={norm:.4} first2={:.4?}",
@@ -201,7 +243,7 @@ impl TransformerModel {
             self.gpu.synchronize(stream)?;
             let total_us = t0.elapsed().as_micros();
             let mut indexed: Vec<(usize, u128)> = layer_times.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.cmp(&a.1));
+            indexed.sort_by_key(|x| std::cmp::Reverse(x.1));
             let top5: Vec<String> = indexed
                 .iter()
                 .take(5)

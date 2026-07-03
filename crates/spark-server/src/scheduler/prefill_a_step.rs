@@ -48,24 +48,27 @@ pub fn start_chunked_prefill(
     let req_session_hash = req.session_hash();
     let req_enable_thinking = req.enable_thinking();
     let req_thinking_budget = req.thinking_budget();
+    let req_repetition_detection = req.repetition_detection();
     if req_enable_thinking {
         tracing::info!("Thinking enabled, budget={:?}", req_thinking_budget);
     }
     let req_require_tool_call = req.require_tool_call();
+    let req_tools_present = req.tools_present();
     let req_suppress_tool_call = req.suppress_tool_call();
     let req_disable_mtp = req.disable_mtp();
     let req_seed = req.seed();
     let req_top_logprobs = req.top_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec);
-    let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature) = match req {
+    let mut grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
+    let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
             max_tokens,
             temperature,
             token_tx,
             image_pixels,
+            cancel_flag,
             ..
         } => (
             prompt_tokens,
@@ -73,6 +76,7 @@ pub fn start_chunked_prefill(
             ResponseSink::Streaming(token_tx),
             image_pixels,
             temperature,
+            Some(cancel_flag),
         ),
         InferenceRequest::Blocking {
             prompt_tokens,
@@ -87,6 +91,7 @@ pub fn start_chunked_prefill(
             ResponseSink::Blocking(Some(response_tx)),
             image_pixels,
             temperature,
+            None,
         ),
     };
 
@@ -120,6 +125,17 @@ pub fn start_chunked_prefill(
         // Vision: encode images and store embeddings for chunk 0 token overwrite.
         if !image_pixels.is_empty() {
             model.prepare_vision_embed(&image_pixels)?;
+            // prepare_vision_embed() runs the vision encoder asynchronously on
+            // the default stream, writing this request's patch embeddings into
+            // the encoder's buf_out. The chunk-0 embedding injection inside
+            // prefill_chunk() runs on prefill_stream and reads buf_out. Without
+            // ordering between the two streams, the injection reads buf_out
+            // BEFORE this request's encode lands and overlays the PREVIOUS
+            // request's image embeddings — lag-by-one cross-image contamination
+            // (and torn reads / illegal access under interleaved load). Make
+            // prefill_stream wait for the encode to complete before injecting.
+            model.record_event(prefill_event, model.default_stream())?;
+            model.stream_wait_event(prefill_stream, prefill_event)?;
         }
 
         // EP: broadcast chunk 0 tokens to worker.
@@ -127,7 +143,7 @@ pub fn start_chunked_prefill(
         // identical Marconi prefix-cache lookups (bug #33 fix).
         // Uses bulk broadcast (single NCCL op) instead of per-token broadcast
         // which caused NCCL timeouts on long prompts (6K+ tokens = 6K+ broadcasts).
-        model.ep_broadcast_cmd(0xFFFFFFF0)?;
+        model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(chunk_len as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
@@ -154,7 +170,8 @@ pub fn start_chunked_prefill(
                     "prefill_a_step: free_sequence (after prefill error): {free_err:#}"
                 );
             }
-            if let Err(bcast_err) = model.ep_broadcast_cmd(0xFFFFFFF1) {
+            if let Err(bcast_err) = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1)
+            {
                 tracing::error!(
                     "prefill_a_step: ep_broadcast (after prefill error): {bcast_err:#}"
                 );
@@ -174,7 +191,17 @@ pub fn start_chunked_prefill(
 
     if is_last {
         // Single chunk covered the entire prompt — get first token.
-        let first = match sample_token(model, logits, temperature, top_k, top_p, eos_tokens) {
+        // #131: constrain the FIRST token with the grammar (and advance the
+        // matcher). Mirrors prefill_b_step; no-op when no grammar is active.
+        let first = match sample_first_token(
+            model,
+            logits,
+            temperature,
+            top_k,
+            top_p,
+            eos_tokens,
+            grammar_state.as_mut(),
+        ) {
             Ok(t) => {
                 tracing::info!("Prefill first token: {t}");
                 t
@@ -187,7 +214,9 @@ pub fn start_chunked_prefill(
                         "prefill_a_step: free_sequence (after sample error): {free_err:#}"
                     );
                 }
-                if let Err(bcast_err) = model.ep_broadcast_cmd(0xFFFFFFF1) {
+                if let Err(bcast_err) =
+                    model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1)
+                {
                     tracing::error!(
                         "prefill_a_step: ep_broadcast (after sample error): {bcast_err:#}"
                     );
@@ -207,6 +236,9 @@ pub fn start_chunked_prefill(
         // When grammar is active, disable legacy require_tool_call (grammar handles EOS).
         let use_legacy_tool_call =
             req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
+        // F4: sticky tool-request flag — grammar attached OR legacy tool path.
+        // Computed before `grammar_state` is moved into the ActiveSeq below.
+        let tool_request = grammar_state.is_some() || use_legacy_tool_call;
 
         let now = Instant::now();
         let cached_prompt_tok = seq.cached_prefix_tokens as u32;
@@ -221,6 +253,7 @@ pub fn start_chunked_prefill(
                 eos_tokens: eos_tokens.to_vec(),
                 finished: true,
                 sink,
+                cancel_flag: cancel_flag.clone(),
                 temperature,
                 top_k,
                 top_p,
@@ -240,30 +273,38 @@ pub fn start_chunked_prefill(
                 inside_thinking: req_enable_thinking && think_end_token.is_some(),
                 enable_thinking: req_enable_thinking,
                 thinking_budget: req_thinking_budget,
+                repetition_detection: req_repetition_detection,
                 spontaneous_think_budget,
                 thinking_tokens: 0,
                 cached_prompt_tokens: cached_prompt_tok,
                 force_end_thinking: false,
+                sentence_defer_count: 0,
                 consecutive_confident: 0,
+                in_code_fence: false,
                 think_end_token,
                 think_start_token,
                 think_ended: !req_enable_thinking && think_end_token.is_some(),
                 think_just_ended: false,
                 think_skip_count: 0,
                 require_tool_call: use_legacy_tool_call,
+                tool_request,
+                tools_present: req_tools_present,
                 tool_call_start_token,
                 tool_call_opened: false,
                 inside_tool_body: false,
+                tool_call_completed: false,
+                post_completion_tool_opens: 0,
+                tool_body_streak_tokens: 0,
+                inside_parameter_body: false,
+                param_body_chars_emitted: 0,
                 suppress_tool_call: req_suppress_tool_call,
                 disable_mtp: req_disable_mtp,
                 content_started: false,
                 content_tokens: 0,
                 prose_tokens_since_last_tool: 0,
                 think_watchdog_fires: 0,
-                entropy_collapse_streak: 0,
-                f27_fingerprint_ring: std::collections::VecDeque::with_capacity(F27_RING_CAP),
-                f27_attractor_streak: 0,
-                f27_last_emitted_token: 0,
+                rollback_count: 0,
+                ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
                 tool_call_end_token,
                 grammar_state,
                 last_token_time: now,
@@ -292,6 +333,7 @@ pub fn start_chunked_prefill(
                 eos_tokens: eos_tokens.to_vec(),
                 finished: false,
                 sink,
+                cancel_flag,
                 temperature,
                 top_k,
                 top_p,
@@ -316,11 +358,14 @@ pub fn start_chunked_prefill(
                 } else {
                     req_thinking_budget
                 },
+                repetition_detection: req_repetition_detection,
                 spontaneous_think_budget,
                 thinking_tokens: 0,
                 cached_prompt_tokens: cached_prompt_tok,
                 force_end_thinking: false,
+                sentence_defer_count: 0,
                 consecutive_confident: 0,
+                in_code_fence: false,
                 think_end_token,
                 think_start_token,
                 think_ended: if spontaneous_think {
@@ -331,19 +376,24 @@ pub fn start_chunked_prefill(
                 think_just_ended: false,
                 think_skip_count: 0,
                 require_tool_call: use_legacy_tool_call,
+                tool_request,
+                tools_present: req_tools_present,
                 tool_call_start_token,
                 tool_call_opened: false,
                 inside_tool_body: false,
+                tool_call_completed: false,
+                post_completion_tool_opens: 0,
+                tool_body_streak_tokens: 0,
+                inside_parameter_body: false,
+                param_body_chars_emitted: 0,
                 suppress_tool_call: req_suppress_tool_call,
                 disable_mtp: req_disable_mtp,
                 content_started: false,
                 content_tokens: 0,
                 prose_tokens_since_last_tool: 0,
                 think_watchdog_fires: 0,
-                entropy_collapse_streak: 0,
-                f27_fingerprint_ring: std::collections::VecDeque::with_capacity(F27_RING_CAP),
-                f27_attractor_streak: 0,
-                f27_last_emitted_token: 0,
+                rollback_count: 0,
+                ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
                 tool_call_end_token,
                 grammar_state,
                 last_token_time: now,
@@ -366,6 +416,7 @@ pub fn start_chunked_prefill(
             min_tokens: req_min_tokens,
             eos_tokens: eos_tokens.to_vec(),
             sink,
+            cancel_flag,
             request_start,
             temperature,
             top_k,
@@ -387,8 +438,10 @@ pub fn start_chunked_prefill(
             logit_bias,
             enable_thinking: req_enable_thinking,
             thinking_budget: req_thinking_budget,
+            repetition_detection: req_repetition_detection,
             spontaneous_think_budget,
             require_tool_call: req_require_tool_call,
+            tools_present: req_tools_present,
             suppress_tool_call: req_suppress_tool_call,
             disable_mtp: req_disable_mtp,
             grammar_state,

@@ -105,9 +105,40 @@ pub(crate) fn resolve_prefill_budget(
     } else {
         prefill_budget_pre_hss
     };
-    let max_batch_tokens = (prefill_budget + args.max_batch_size)
+    // Default: max_batch_tokens = prefill_budget + max_batch_size (decode slots).
+    // ATLAS_MAX_BATCH_TOKENS env var override allows engaging the Q12 batched
+    // kernel-dispatch path which requires `arena_cap >= N_streams × chunk_len`.
+    // Set to (e.g.) 16384 with max_batch_size=4 to fit 4 stacked 4K chunks.
+    // Memory cost: arena buffers scale ~linearly with max_batch_tokens —
+    // 8× value → ~8× arena footprint (~5GB for Qwen3-Next-80B). Use sparingly.
+    let default_max_batch_tokens = (prefill_budget + args.max_batch_size)
         .max(spec_tokens)
         .max(args.max_batch_size);
+    let max_batch_tokens = match std::env::var("ATLAS_MAX_BATCH_TOKENS") {
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if n >= default_max_batch_tokens => {
+                tracing::info!(
+                    "ATLAS_MAX_BATCH_TOKENS override: {} (default would be {})",
+                    n,
+                    default_max_batch_tokens
+                );
+                n
+            }
+            Ok(n) => {
+                tracing::warn!(
+                    "ATLAS_MAX_BATCH_TOKENS={} ignored — must be >= default {}",
+                    n,
+                    default_max_batch_tokens
+                );
+                default_max_batch_tokens
+            }
+            Err(e) => {
+                tracing::warn!("ATLAS_MAX_BATCH_TOKENS parse error: {e}");
+                default_max_batch_tokens
+            }
+        },
+        Err(_) => default_max_batch_tokens,
+    };
     tracing::info!(
         "Prefill config: ssm_prefill_chunk={}, args.max_prefill_tokens={}, prefill_budget={}, max_batch_tokens={}",
         ssm_prefill_chunk,
@@ -205,25 +236,22 @@ pub(crate) fn resolve_kv_cache_config(
             0
         }),
     };
-    let kv_hp_layers = if kv_hp_layers == 0
-        && matches!(
-            kv_dtype,
-            spark_runtime::kv_cache::KvCacheDtype::Turbo3
-                | spark_runtime::kv_cache::KvCacheDtype::Turbo4
-                | spark_runtime::kv_cache::KvCacheDtype::Turbo8
-        ) {
-        let auto_hp = ((num_attn_layers as f32 / 3.0).ceil() as usize).max(2);
-        tracing::info!(
-            "Auto-enabling --kv-high-precision-layers {} for {} ({}/{} attn layers BF16; \
-             scaled with attn-layer count to keep accumulated turbo quant error tractable)",
-            auto_hp,
-            effective_kv_dtype_str,
-            (auto_hp * 2).min(num_attn_layers),
-            num_attn_layers,
-        );
-        auto_hp
-    } else {
-        kv_hp_layers
+    let kv_hp_layers = match (
+        kv_hp_layers,
+        crate::main_modules::auto_high_precision_layers(kv_dtype, num_attn_layers),
+    ) {
+        (0, Some(auto_hp)) => {
+            tracing::info!(
+                "Auto-enabling --kv-high-precision-layers {} for {} ({}/{} attn layers BF16; \
+                 scaled with attn-layer count to keep accumulated turbo quant error tractable)",
+                auto_hp,
+                effective_kv_dtype_str,
+                (auto_hp * 2).min(num_attn_layers),
+                num_attn_layers,
+            );
+            auto_hp
+        }
+        _ => kv_hp_layers,
     };
     if kv_hp_layers == 0 && kv_dtype != spark_runtime::kv_cache::KvCacheDtype::Bf16 {
         tracing::warn!(
@@ -233,8 +261,12 @@ pub(crate) fn resolve_kv_cache_config(
             effective_kv_dtype_str,
         );
     }
-    let layer_dtypes =
-        crate::main_modules::build_layer_kv_dtypes(kv_dtype, num_attn_layers, kv_hp_layers);
+    let layer_dtypes = crate::main_modules::build_layer_kv_dtypes(
+        kv_dtype,
+        num_attn_layers,
+        kv_hp_layers,
+        spark_runtime::kv_cache::KvCacheDtype::Bf16,
+    );
     let hss_cache_blocks_per_seq = if args.high_speed_swap {
         Some(args.high_speed_swap_cache_blocks_per_seq)
     } else {

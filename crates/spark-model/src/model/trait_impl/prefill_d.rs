@@ -127,6 +127,11 @@ impl TransformerModel {
                 Err(_) => None,
             };
             if let Some(snap_id) = snap_result {
+                // Order any later warm restore after this save's D2D (the
+                // restore may run on a different stream under concurrency).
+                if let Err(e) = self.record_snapshot_save_dispatch(stream) {
+                    tracing::warn!("prefill snapshot save: record snapshot event: {e}");
+                }
                 if self.tokens_have_vision_pad(tokens) {
                     // Vision prefill: snapshot is image-tainted and the
                     // token stream collides across distinct images, so do
@@ -217,24 +222,41 @@ impl TransformerModel {
                 }
             };
             if let Some(snap_id) = snap_result {
-                tracing::info!(
-                    "Saved SSM snapshot {} for {} tokens ({} blocks) [twophase]",
-                    snap_id,
-                    tokens.len(),
-                    seq.block_table.len(),
-                );
-                let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
-                    tokens,
-                    &seq.block_table,
-                    &seq.disk_block_ids,
-                    bs,
-                    snap_id,
-                    seq.session_hash,
-                    seq.cached_prefix_tokens,
-                );
-                super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
-                if let Some(old) = displaced {
-                    self.ssm_snapshots.free(old);
+                // Order any later warm restore after this save's D2D (the
+                // restore may run on a different stream under concurrency).
+                if let Err(e) = self.record_snapshot_save_dispatch(stream) {
+                    tracing::warn!("prefill snapshot save [twophase]: record snapshot event: {e}");
+                }
+                if self.tokens_have_vision_pad(tokens) {
+                    // Vision prefill: the SSM snapshot is image-tainted and
+                    // the token stream collides across distinct images (the
+                    // prefix-cache key hashes token IDs only, and image-pad
+                    // placeholders are identical regardless of pixel content),
+                    // so admitting this entry returns a stale image's result
+                    // on the next same-prompt request (issue #58). Free the
+                    // snapshot and skip the radix insert, matching the gated
+                    // standard path in `prefill_save_snapshot_with_vision_gate`.
+                    self.ssm_snapshots.free(snap_id);
+                } else {
+                    tracing::info!(
+                        "Saved SSM snapshot {} for {} tokens ({} blocks) [twophase]",
+                        snap_id,
+                        tokens.len(),
+                        seq.block_table.len(),
+                    );
+                    let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
+                        tokens,
+                        &seq.block_table,
+                        &seq.disk_block_ids,
+                        bs,
+                        snap_id,
+                        seq.session_hash,
+                        seq.cached_prefix_tokens,
+                    );
+                    super::super::block_mgmt::cache_acquires_disk_refs(&acquired);
+                    if let Some(old) = displaced {
+                        self.ssm_snapshots.free(old);
+                    }
                 }
             } else if !self.tokens_have_vision_pad(tokens) {
                 let acquired = self.prefix_cache.insert(

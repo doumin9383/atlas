@@ -24,7 +24,7 @@ jobs:
     name: cargo fmt --check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -34,7 +34,7 @@ jobs:
     name: cargo clippy --tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install vendor/xgrammar-rs build deps
         run: |
           sudo apt-get update
@@ -55,8 +55,8 @@ jobs:
     name: SPDX license headers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: apache/skywalking-eyes/header@v0.6.0
+      - uses: actions/checkout@v7
+      - uses: apache/skywalking-eyes/header@v0.8.0
         with:
           config: .licenserc.yaml
           mode: check
@@ -65,14 +65,14 @@ jobs:
     name: typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: crate-ci/typos@master
 
   test:
     name: cargo test --workspace
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install vendor/xgrammar-rs build deps
         run: |
           sudo apt-get update
@@ -119,6 +119,10 @@ jobs:
           int cuModuleLoadData(void **a, const void *b) { (void)a; (void)b; return 100; }
           int cuModuleUnload(void *a) { (void)a; return 100; }
           int cuModuleGetFunction(void **a, void *b, const char *c) { (void)a; (void)b; (void)c; return 100; }
+          int cuModuleGetGlobal_v2(unsigned long long *dptr, unsigned long *bytes,
+                                   void *hmod, const char *name) {
+              (void)dptr; (void)bytes; (void)hmod; (void)name; return 100;
+          }
           int cuFuncSetAttribute(void *f, int attr, int val) { (void)f; (void)attr; (void)val; return 100; }
           int cuLaunchKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
                              unsigned int bx, unsigned int by, unsigned int bz,
@@ -250,7 +254,7 @@ jobs:
     name: cargo test --features metal (macOS aarch64)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Apple Silicon path: no CUDA toolchain, no nvcc. The `metal`

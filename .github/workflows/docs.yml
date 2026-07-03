@@ -9,14 +9,11 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/docs.yml'
+  # No path filter on pull_request: this check is in the required set, and a
+  # path-filtered required check never reports on PRs outside its paths
+  # (kernel-only diffs), leaving them permanently "expected" and unmergeable.
   pull_request:
     branches: [main, master]
-    paths:
-      - 'book/**'
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/docs.yml'
 
 concurrency:
   group: docs-${{ github.ref }}
@@ -40,7 +37,7 @@ jobs:
     name: Build mdBook + rustdoc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install vendor/xgrammar-rs build deps
         run: |
@@ -80,7 +77,7 @@ jobs:
           EOF
 
       - name: Upload site artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docs-site
           path: book/output
@@ -115,7 +112,7 @@ jobs:
 
       - name: Download site artifact
         if: steps.secret_check.outputs.configured == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: docs-site
           path: site
@@ -128,7 +125,7 @@ jobs:
 
       - name: Load SSH key
         if: steps.secret_check.outputs.configured == 'true'
-        uses: webfactory/ssh-agent@v0.9.0
+        uses: webfactory/ssh-agent@v0.10.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
 

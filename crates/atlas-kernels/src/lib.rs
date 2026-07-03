@@ -20,7 +20,18 @@ use atlas_core::target::KernelTarget;
 
 // Auto-generated: per-target PTX constants, ptx_modules() function,
 // and all_ptx_sets() for multi-target builds.
+// NOTE: cargo does NOT track this build-script-generated include! as a
+// recompile trigger, so when build.rs regenerates target_ptx.rs (e.g. the
+// module set changes) this lib can keep a STALE embedded set. Any edit to
+// this file (or `cargo clean -p atlas-kernels`) forces a fresh recompile
+// against the current OUT_DIR/target_ptx.rs.
 include!(concat!(env!("OUT_DIR"), "/target_ptx.rs"));
+
+/// Content fingerprint of the generated kernel set, emitted by `build.rs` as a
+/// `rustc-env`. Referencing it here makes cargo recompile this crate whenever
+/// the kernel set changes — closing the `include!`-not-tracked staleness hole
+/// that silently embedded a stale module list (the 98-vs-99 regression).
+pub const KERNEL_SET_HASH: &str = env!("ATLAS_KERNEL_SET_HASH");
 
 // ═══════════════════════════════════════════════════════════════════
 // Target-aware PTX grouping
@@ -163,7 +174,107 @@ pub struct ModelBehavior {
     /// JSON arrays of similar objects, multiplication tables). Enable only
     /// when the model has been observed to need it.
     pub enable_loop_watchdog: bool,
+    /// Server-side min-p FLOOR (0.0 = disabled). Applied as `min_p.max(floor)`
+    /// AFTER request/preset resolution, so it binds even when a client sends
+    /// `min_p = 0` (or omits it on a server without `--default-min-p`). On
+    /// drift-prone quantized models (FP8 / NVFP4 lm-head) an unfloored tail
+    /// lets the degenerate low-probability tail be sampled into repetition
+    /// loops + argmax-flip garbling on long generation — the Claude-Code
+    /// failure mode. MEASURED 2026-06-07 (nvfp4-head@64k): 0.05 turned 4 loop-
+    /// watchdog fires → 0. Set in MODEL.toml `[behavior]`.
+    pub min_p_floor: f32,
+    /// Server-side temperature CEILING (0.0 = disabled). `temperature.min(max)`
+    /// AFTER resolution — defense-in-depth net against a client sending a high
+    /// temperature; min_p_floor is the dominant lever. Set in MODEL.toml.
+    pub temperature_max: f32,
+    /// Thinking-loop watchdog: substring-occurrence count that trips a
+    /// forced `</think>`. Default 3 (historical `THINK_LOOP_MIN_REPEATS`).
+    pub think_loop_min_repeats: u32,
+    /// Thinking-loop watchdog: trailing-token scan window. Default 160.
+    pub think_loop_scan_window: u32,
+    /// F2 confidence-run early-stop enabled. Default `true`. Set false
+    /// for models whose deterministic code drafting trips the heuristic.
+    pub confidence_early_stop: bool,
+    /// F2 confidence run length before arming forced `</think>`.
+    /// Default 30.
+    pub confidence_run_length: u32,
+    /// Fuzzy-repetition detector Hamming tolerance divisor: a
+    /// `pattern_len`-token window tolerates `pattern_len / div`
+    /// mismatches. Default 12 (~8%).
+    pub fuzzy_repeat_tolerance_div: u32,
+    /// Cap on free-text tokens between successive `<tool_call>` opens in
+    /// `tool_choice=auto`. Default 384. Agentic coding may want larger.
+    pub max_inter_tool_prose: u32,
+    /// Unconditional per-generation cap on post-`</think>` content tokens
+    /// for tool-active requests (grammar attached). Bounds a runaway where
+    /// a grammar-legal-but-never-closing tool value burns to `max_tokens`
+    /// (the dominant opencode `webserver_ok` 360s-timeout cause). Default
+    /// 100_000 — effectively unbounded, the historical no-op — so a model
+    /// that sets nothing is byte-identical to before. Set a small value
+    /// (e.g. 1536) per-model to backstop the runaway. Never caps plain
+    /// chat: the runtime gate also requires `grammar_state.is_some()`.
+    pub max_post_think_content_tokens: u32,
+    /// TSCG (Tool-Schema Compilation) enabled — compile tool JSON
+    /// schemas to compact function signatures before prompting.
+    /// Default `false`; the TAS operator is tokenizer-specific so
+    /// enable + verify per model. arXiv:2605.04107.
+    pub tscg: bool,
+    /// Disable XGrammar tool-call constrained decoding for this model.
+    /// Default `false`. Escape hatch for the "structure snowballing"
+    /// alignment tax (arXiv:2604.06066) — a few models tool-call more
+    /// reliably unconstrained. When `true`, tool calls are parsed but
+    /// not grammar-enforced.
+    pub disable_tool_grammar: bool,
+    /// Phase-C: when a decode-time watchdog (content-loop, fuzzy-repeat,
+    /// inter-tool prose) detects degeneration, roll the sequence back to
+    /// the last well-formed boundary and let generation re-steer, instead
+    /// of hard-stopping the response. Default `true` (recovers responses,
+    /// especially mid-tool-call — arXiv:2603.27905 ATLAS-RTC). Set `false`
+    /// to keep the legacy hard-stop behavior. Capped at
+    /// [`crate::ROLLBACK_RESTEER_CAP`] rollbacks per sequence, after which
+    /// the hard-stop fires regardless.
+    pub rollback_resteer: bool,
+    /// Phase-C ROM (arXiv:2603.22016) scaffold. Path to a trained
+    /// repetition-onset detection head artifact. Empty string = no ROM
+    /// head; the F2 confidence heuristic stays as the fallback. A trained
+    /// artifact can be dropped in later via MODEL.toml
+    /// `[behavior].rom_head` without further code changes — the runtime
+    /// loads it through the `RomHead` trait seam. The detector
+    /// itself is intentionally NOT implemented (no per-model trained head
+    /// is available); only the optional hook is wired.
+    pub rom_head: &'static str,
+    /// Tier 5c (2026-05-26): one-shot tool-call re-roll on hard
+    /// validation failure. When `true`, `validate_tool_calls` errors on
+    /// the chat path fire a single retry inference with the same
+    /// grammar spec + a correction nudge appended to the prompt. If the
+    /// retry produces valid tool calls, they replace the failed call
+    /// before the response leaves the server. Default `true` — the
+    /// blocking-path canonical-probe trace shows a write-→bash recovery
+    /// path that's strictly better than the previous "`[atlas]` Tool call
+    /// rejected" content fallback. Set `false` per-model when a
+    /// specific model is known to ALWAYS get tool args right on the
+    /// first attempt (extra inference round-trip cost is wasted there).
+    pub tool_retry: bool,
 }
+
+/// Phase-C: maximum number of watchdog-triggered rollbacks a single
+/// sequence may perform before the watchdog reverts to a hard stop.
+/// Bounds the worst case where re-steering re-enters the same attractor
+/// — without this a degenerate sequence could rollback indefinitely.
+pub const ROLLBACK_RESTEER_CAP: u32 = 2;
+
+/// Phase-C: number of boundary SSM-state snapshots retained per sequence in
+/// the decode-rollback ring (hybrid GDN/Mamba models). DECOUPLED from
+/// [`ROLLBACK_RESTEER_CAP`]: the cap bounds how many times we re-steer, but
+/// the ring must retain enough *boundary* snapshots that a clean PRE-loop
+/// boundary survives long enough to roll back to. Sizing it at the old
+/// `CAP + 1 = 3` meant a loop spanning ≥3 sentence/newline boundaries evicted
+/// the clean boundary before the fuzzy detector (3 repeats) fired, forcing a
+/// `NoSsmSnapshot` decline → hard-stop (observed: Claude-Code @ nvfp4-head,
+/// 2026-06-07). 8 covers the 3-repeat detector with margin at modest cost
+/// (8 × max_batch × per-layer GDN state, allocated once). Pure-attention
+/// models ignore this (their ring is 0; they roll back to any boundary).
+pub const DECODE_ROLLBACK_RING_SLOTS: usize = 8;
 
 impl Default for ModelBehavior {
     fn default() -> Self {
@@ -177,6 +288,20 @@ impl Default for ModelBehavior {
             disable_tool_steering: false,
             tool_call_parser: "",
             enable_loop_watchdog: false,
+            min_p_floor: 0.0,
+            temperature_max: 0.0,
+            think_loop_min_repeats: 3,
+            think_loop_scan_window: 160,
+            confidence_early_stop: true,
+            confidence_run_length: 30,
+            fuzzy_repeat_tolerance_div: 12,
+            max_inter_tool_prose: 384,
+            max_post_think_content_tokens: 100_000,
+            tscg: false,
+            disable_tool_grammar: false,
+            rollback_resteer: true,
+            rom_head: "",
+            tool_retry: true,
         }
     }
 }
@@ -209,10 +334,15 @@ pub struct DflashConfig {
     pub target_layer_ids: &'static [usize],
 }
 
-/// PTX modules hyperoptimized for a specific (H, M_q) target.
+/// Kernel modules hyperoptimized for a specific (H, M_q) target.
+///
+/// Each blob is the compiled kernel for one module, emitted uniformly as
+/// `&'static [u8]` by build.rs (`include_bytes!`). NVIDIA PTX is ASCII
+/// text but valid as bytes; SCALE/AMD and Metal produce binary objects.
+/// The runtime registry sniffs text-vs-binary per blob at load time.
 pub struct TargetPtxSet {
     pub target: KernelTarget,
-    pub modules: Vec<(&'static str, &'static str)>,
+    pub modules: Vec<(&'static str, &'static [u8])>,
     pub sampling: SamplingPresets,
     pub behavior: ModelBehavior,
     pub model_type_matches: Vec<ModelTypeMatch>,
@@ -271,11 +401,16 @@ mod tests {
 
     #[test]
     fn all_ptx_modules_non_empty() {
-        for (name, ptx) in ptx_modules() {
+        for (name, blob) in ptx_modules() {
             assert!(
-                !ptx.is_empty(),
+                !blob.is_empty(),
                 "PTX module '{name}' is empty — nvcc compilation may have failed"
             );
+            // Blobs are `&[u8]` (uniform across backends). For the NVIDIA
+            // build under test the bytes are ASCII PTX, so decode and check
+            // the `.version` directive; on a non-text backend this lossily
+            // decodes to "" and the assert would (correctly) not apply.
+            let ptx = std::str::from_utf8(blob).unwrap_or("");
             assert!(
                 ptx.contains(".version"),
                 "PTX module '{name}' doesn't contain .version directive"

@@ -4,6 +4,39 @@
 
 use atlas_core::config::ModelConfig;
 
+/// Streams assumed when provisioning scratch for the Q12 kernel-batched
+/// prefill path. The per-stream metadata region scales with N, so the
+/// scratch buffer must be sized for a realistic max concurrent batched
+/// streams. Beyond this, `check_kernel_batched_eligible` falls the dispatch
+/// back to the per-stream path (which respects the same arena cap), so this
+/// bound only governs how often the fast path is available — never safety.
+pub const Q12_SIZING_STREAMS: usize = 8;
+
+/// Exact scratch footprint (bytes) of the Q12 kernel-batched prefill staging
+/// for `n` streams of `chunk_len` tokens each. SSOT for both scratch sizing
+/// (`BufferSizes::from_config`) and the pre-flight eligibility check
+/// (`check_kernel_batched_eligible`), so the two can never disagree about
+/// whether a batch fits. Mirrors the staging layout in `batch_kernel.rs`
+/// (MoE topk area + N per-stream meta blocks) and `stage_batched.rs`
+/// (stacked positions ×(3 if MRoPE) + slots + block/seq_len pointer arrays)
+/// plus the per-SSM-layer `h_state_ptrs` JIT slot.
+pub fn q12_batched_scratch_bytes(n: usize, chunk_len: usize, top_k: usize, mrope: bool) -> usize {
+    let total = n * chunk_len;
+    // MoE topk staging (indices+weights, both ×n streams), 64-byte aligned.
+    let moe = ((total * top_k * 4 * 2) + 63) & !63;
+    // Per-stream meta block — same formula as batch_kernel.rs.
+    let per_stream_meta = ((chunk_len * 16) + 64).max(4096);
+    // Stacked BatchedAttnMetadata (stage_batched.rs layout).
+    let pos = (total * 4 + 7) & !7;
+    let pos_streams = if mrope { 3 } else { 1 };
+    let slot = (total * 8 + 7) & !7;
+    let ptrs = ((n * std::mem::size_of::<u64>()) + 7) & !7;
+    let stage_meta = pos_streams * pos + slot + 2 * ptrs;
+    // h_state_ptrs JIT slot consumed per SSM layer (N device pointers).
+    let h_state_ptrs = n * std::mem::size_of::<u64>();
+    moe + n * per_stream_meta + stage_meta + h_state_ptrs
+}
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -13,6 +46,13 @@ pub struct BufferSizes {
     pub qkv_output: usize,
     pub attn_output: usize,
     pub gate_logits: usize,
+    /// FP32 gate logits [m, num_experts] for the ATLAS_FP32_GATE routing path.
+    /// Keeps the router GEMM accumulator unrounded into top-K so near-tied
+    /// experts don't flip on a BF16 store. Allocated whenever num_experts > 0.
+    pub gate_logits_f32: usize,
+    /// FP32 MoE-input norm output [m, hidden] for ATLAS_FP32_ROUTING — the
+    /// full-precision router_in the gate GEMM consumes. Allocated when experts > 0.
+    pub moe_router_in_f32: usize,
     pub moe_output: usize,
     pub logits: usize,
     pub ssm_qkvz: usize,
@@ -25,6 +65,26 @@ pub struct BufferSizes {
     pub expert_up_out: usize,
     pub expert_down_out: usize,
     pub splitk_workspace: usize,
+    /// GDN FLA chunked-prefill scratch (single buffer, sub-divided W|U|S|uc).
+    /// 0 unless the model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
+    pub gdn_fla_scratch: usize,
+    /// Grouped O-projection latent: `[M, o_groups*o_lora_rank]` BF16 (V4-Flash).
+    /// 256 (placeholder) when `o_groups == 0`.
+    pub o_latent: usize,
+    /// Zero-filled BF16 weight (length max_dim) for unweighted RMSNorm under the
+    /// offset-from-1 kernel convention (scale = 1+weight → 1.0). DeepSeek-V4 q_b_norm.
+    pub norm_unit_w: usize,
+    /// HC residual streams: `[M, hc_mult, hidden]` BF16 (DeepSeek-V4 mHC).
+    /// 256 (placeholder) when `hc_mult == 0`.
+    pub hc_streams: usize,
+    /// HC `post` mixing weights: `[M, hc_mult]` F32.
+    pub hc_post: usize,
+    /// HC `comb` Sinkhorn matrix: `[M, hc_mult, hc_mult]` F32.
+    pub hc_comb: usize,
+    /// Token IDs `[M]` u32 for the current pass — stable across the layer loop
+    /// so DeepSeek-V4 hash-MoE layers can read `tid2eid[token_id]`. Always
+    /// allocated (small); unused by models without hash routing.
+    pub token_ids: usize,
 }
 
 impl BufferSizes {
@@ -69,11 +129,10 @@ impl BufferSizes {
         //
         // MoE scratch: 2 * M * top_k * 4 (indices [M*top_k] u32 + weights [M*top_k] f32)
         let moe_scratch = 2 * m * top_k * 4;
-        let max_blocks = if kv_block_size > 0 {
-            max_seq_len / kv_block_size + 1
-        } else {
-            256
-        };
+        let max_blocks = max_seq_len
+            .checked_div(kv_block_size)
+            .map(|q| q + 1)
+            .unwrap_or(256);
         // Prefill metadata: mirrors exact layout in prefill_chunk(). MRoPE
         // (Qwen3-VL / Qwen3.6) uploads THREE u32 position streams packed
         // back-to-back (T, H, W); every other model uploads ONE. Sizing the
@@ -96,7 +155,24 @@ impl BufferSizes {
         let bt_rows = 32usize; // headroom for K=γ DFlash verify (typical γ=16, K=17)
         let bt_meta = 32768 + 768 + bt_rows * max_blocks * 4;
         let scratch_min = 64 * 1024;
-        let scratch = scratch_min.max(moe_scratch + prefill_meta).max(bt_meta);
+        // Q12 kernel-batched prefill stages N per-stream meta blocks plus a
+        // stacked BatchedAttnMetadata block — a strictly larger footprint than
+        // the single-stream `prefill_meta`. Provision for `Q12_SIZING_STREAMS`
+        // streams splitting the full token arena so the fast path stays
+        // available for deep-context concurrent prefills without overrunning
+        // scratch (#110: the unprovisioned N-stream multiplication overran the
+        // buffer, producing an out-of-range HtoD → sticky CUDA-700).
+        let q12_chunk = m.div_ceil(Q12_SIZING_STREAMS).max(1);
+        let q12_batched = q12_batched_scratch_bytes(
+            Q12_SIZING_STREAMS,
+            q12_chunk,
+            top_k,
+            config.mrope_interleaved,
+        );
+        let scratch = scratch_min
+            .max(moe_scratch + prefill_meta)
+            .max(bt_meta)
+            .max(q12_batched);
 
         // Batched expert output buffers for MoE (or dense FFN).
         // Sized for max(K=3 verify, prefill chunk) × top_k experts.
@@ -132,9 +208,32 @@ impl BufferSizes {
         // Total slots = num_seqs * num_splits ≤ NUM_SMS, so this is constant ~48 KB.
         let splitk_workspace = 48 * (hd + 2) * 4;
 
-        // Residual dtype controlled by config.use_fp32_residual().
-        // FP32 prevents BF16 truncation across 48 layers but costs 2x bandwidth.
-        let residual_elem = if config.use_fp32_residual() { 4 } else { bf16 };
+        // The residual stream is always BF16.
+        let residual_elem = bf16;
+
+        // GDN FLA chunked-prefill scratch — ONE buffer holding W|U|S|uc back-to-back,
+        // sized for the chunked-prefill arena (nt = ceil(max_batch_tokens / CHUNK)).
+        // Only the 128-dim-linear-head GDN path uses it (the FLA kernels are compiled
+        // for K_DIM=V_DIM=128); 0 otherwise so BufferArena allocs NULL and the
+        // ATLAS_GDN_FLA dispatch stays disabled. Layout per region:
+        //   W  [nt*nv][CHUNK][kd] bf16 ; U,uc [nt*nv][CHUNK][vd] bf16 ; S [nt*nv][kd][vd] f32.
+        const FLA_CHUNK: usize = 64;
+        let gdn_fla_scratch = if config.linear_num_value_heads > 0
+            && config.linear_key_head_dim == 128
+            && config.linear_value_head_dim == 128
+        {
+            let nt = m.div_ceil(FLA_CHUNK);
+            let nv = config.linear_num_value_heads;
+            let kd = config.linear_key_head_dim;
+            let vd = config.linear_value_head_dim;
+            let w = nt * nv * FLA_CHUNK * kd * bf16;
+            let u = nt * nv * FLA_CHUNK * vd * bf16;
+            let s = nt * nv * kd * vd * 4;
+            let uc = nt * nv * FLA_CHUNK * vd * bf16;
+            w + u + s + uc
+        } else {
+            0
+        };
 
         Self {
             hidden_states: m * h * residual_elem,
@@ -153,6 +252,16 @@ impl BufferSizes {
                 }),
             gate_logits: if config.num_experts > 0 {
                 m * config.num_experts * bf16
+            } else {
+                256
+            },
+            gate_logits_f32: if config.num_experts > 0 {
+                m * config.num_experts * 4
+            } else {
+                256
+            },
+            moe_router_in_f32: if config.num_experts > 0 {
+                m * h * 4
             } else {
                 256
             },
@@ -208,6 +317,33 @@ impl BufferSizes {
             expert_up_out,
             expert_down_out,
             splitk_workspace,
+            gdn_fla_scratch,
+            // Grouped O-projection latent (V4-Flash): [M, o_groups*o_lora_rank].
+            o_latent: (m * config.o_groups * config.o_lora_rank * bf16).max(256),
+            // Zero-filled weight for unweighted RMSNorm (q_b_norm).
+            norm_unit_w: max_dim * bf16,
+            // HC buffers: only allocated for DeepSeek-V4 (hc_mult > 0).
+            hc_streams: if config.hc_mult > 0 {
+                // FP32 mHC highway: the residual streams grow large across the
+                // blocks (the manifold-mixing is norm-preserving, eigenvalue 1),
+                // so BF16 storage swamps the small per-layer signal at scale and
+                // collapses generation. Store the streams in FP32 (4 bytes).
+                m * config.hc_mult * h * 4
+            } else {
+                256
+            },
+            hc_post: if config.hc_mult > 0 {
+                (m * config.hc_mult * 4).max(256)
+            } else {
+                256
+            },
+            hc_comb: if config.hc_mult > 0 {
+                (m * config.hc_mult * config.hc_mult * 4).max(256)
+            } else {
+                256
+            },
+            // Token IDs [M] u32 (stable across the layer loop for hash-MoE).
+            token_ids: (m * 4).max(256),
         }
     }
 
@@ -219,6 +355,8 @@ impl BufferSizes {
             + self.qkv_output
             + self.attn_output
             + self.gate_logits
+            + self.gate_logits_f32
+            + self.moe_router_in_f32
             + self.moe_output
             + self.logits
             + self.ssm_qkvz
@@ -231,5 +369,10 @@ impl BufferSizes {
             + self.expert_up_out
             + self.expert_down_out
             + self.splitk_workspace
+            + self.gdn_fla_scratch
+            + self.hc_streams
+            + self.hc_post
+            + self.hc_comb
+            + self.token_ids
     }
 }

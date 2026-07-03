@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+pub mod deepseek_v4_mtp;
 pub mod dense_ffn;
 pub mod dflash_head;
 pub mod ep_dispatch;
@@ -14,6 +15,7 @@ pub mod qwen3_attention;
 pub mod qwen3_ssm;
 pub mod vision_encoder;
 
+pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
@@ -59,6 +61,14 @@ pub enum FfnComponent {
 impl FfnComponent {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
+    }
+
+    /// ATLAS_FP32_ROUTING active for this FFN (MoE only; false otherwise).
+    pub fn fp32_routing_active(&self) -> bool {
+        match self {
+            Self::Moe(m) => m.fp32_routing_active(),
+            _ => false,
+        }
     }
 
     pub fn forward(

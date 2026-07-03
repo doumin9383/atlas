@@ -12,9 +12,9 @@ use spark_runtime::weights::WeightStore;
 
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::{
-    DflashConfig, Gemma4WeightLoader, MinimaxM2WeightLoader, ModelWeightLoader,
-    NemotronHWeightLoader, Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen35DenseWeightLoader,
-    Qwen35WeightLoader,
+    DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, MinimaxM2WeightLoader,
+    ModelWeightLoader, NemotronHWeightLoader, Qwen3VLWeightLoader, Qwen3WeightLoader,
+    Qwen35DenseWeightLoader, Qwen35WeightLoader, Step3p7WeightLoader,
 };
 
 /// DFlash speculative-decoding build arguments. `None` for non-DFlash runs;
@@ -49,10 +49,17 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "qwen3_next" => Ok(Box::new(Qwen3WeightLoader)),
         "qwen3_vl_moe" => Ok(Box::new(Qwen3VLWeightLoader)),
         "qwen3_5_moe" | "qwen3_5" | "qwen35_moe" | "qwen35" => {
-            if config.is_qwen3_vl() {
-                Ok(Box::new(Qwen3VLWeightLoader))
-            } else if config.is_qwen35_dense() {
+            // Dense check has to come first. Qwen3.6-27B-FP8 is the dense text
+            // sibling of the Qwen3.6 VL family — its config declares the same
+            // `vision_config` block as the MoE-VL siblings (so `is_qwen3_vl()`
+            // returns true), but the checkpoint ships no vision tower and no
+            // MoE router, so the VL loader panics on a missing `mlp.gate`.
+            // `is_qwen35_dense()` requires `num_experts == 0`, which only the
+            // dense text models satisfy — VL-MoE always has experts.
+            if config.is_qwen35_dense() {
                 Ok(Box::new(Qwen35DenseWeightLoader))
+            } else if config.is_qwen3_vl() {
+                Ok(Box::new(Qwen3VLWeightLoader))
             } else {
                 Ok(Box::new(Qwen35WeightLoader))
             }
@@ -72,9 +79,14 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // MiniMax M2 family (M2.1 / M2.7) — full attention + 256-expert
         // sigmoid-routed MoE + 3-module MTP.
         "minimax_m2" => Ok(Box::new(MinimaxM2WeightLoader)),
+        // Step 3.7 Flash — 288-expert sigmoid-routed MoE + shared expert +
+        // mixed full/sliding attention + attention gate + 3 MTP modules.
+        "step3p7" => Ok(Box::new(Step3p7WeightLoader)),
+        // DeepSeek-V4 family (Flash) — MLA + MoE + CSA/HCA hybrid attention + mHC.
+        "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, qwen3_vl_moe, nemotron_h, gemma4, mistral, minimax_m2",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, qwen3_vl_moe, nemotron_h, gemma4, mistral, minimax_m2, deepseek_v4",
             config.model_type,
             normalized,
         ),
@@ -82,6 +94,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
 }
 
 mod build;
+mod lm_head_setup;
 mod m2_setup;
 
 pub use build::build_model;

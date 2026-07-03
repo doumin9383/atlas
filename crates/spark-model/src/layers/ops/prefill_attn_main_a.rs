@@ -59,6 +59,49 @@ pub fn prefill_attention(
         .launch(stream)
 }
 
+/// DeepSeek-V4 full-attention (non-CSA) prefill with a per-head attention sink.
+///
+/// Same as [`prefill_attention`] for HDIM=512 (BR=16), but passes the per-head
+/// `sinks` logit so the softmax denominator matches the decode path (which
+/// always applies the sink). Launches the V4-specific `inferspark_prefill_512`
+/// kernel. `sinks` may be `DevicePtr::NULL` for no sink.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_512_sink(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k: DevicePtr,
+    v: DevicePtr,
+    output: DevicePtr,
+    seq_len: u32,
+    batch: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    inv_sqrt_d: f32,
+    causal: bool,
+    sliding_window: u32,
+    sinks: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(seq_len, 16), batch])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k)
+        .arg_ptr(v)
+        .arg_ptr(output)
+        .arg_u32(seq_len)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(if causal { 1 } else { 0 })
+        .arg_u32(sliding_window)
+        .arg_ptr(sinks)
+        .launch(stream)
+}
+
 /// Contiguous prefill Flash Attention — BF16, BR=64 (256 threads).
 ///
 /// Larger tile size halves CTA count and causal KV iterations for long sequences.
@@ -81,7 +124,15 @@ pub fn prefill_attention_64(
     sliding_window: u32,
     stream: u64,
 ) -> Result<()> {
-    let br = 64u32;
+    // BR64 = query rows processed per CTA. The kernel clamps this to 32 on the
+    // AMD targets (gfx1151 64 KB LDS cap: inferspark_prefill.cu's
+    // `#if __SCALE__ || __HIP_PLATFORM_AMD__ #define BR64 32`). The grid stride
+    // MUST match the kernel's BR64, else CTAs are spaced 64 rows apart while each
+    // writes only 32 → query rows 32..63 of every 64-row band are silently left
+    // unwritten (gross attention corruption for any prompt >32 tokens). cfg!
+    // (atlas_scale) is set for both `strix` and `strix-hip`; NVIDIA keeps 64
+    // (byte-identical). See the @human-review note in inferspark_prefill.cu.
+    let br = if cfg!(atlas_scale) { 32u32 } else { 64u32 };
     KernelLaunch::new(gpu, kernel)
         .grid([num_q_heads, div_ceil(seq_len, br), batch])
         .block([256, 1, 1])

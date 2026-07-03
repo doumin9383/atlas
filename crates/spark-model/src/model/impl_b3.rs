@@ -86,6 +86,8 @@ impl TransformerModel {
             profile: false,
             comm: None,
             graph_capture: false,
+            gdn_exact_replay: false,
+            token_ids: None,
         };
         let prop_state = seq
             .proposer_state
@@ -110,6 +112,13 @@ impl TransformerModel {
     /// same GPU the target uses).
     pub fn gpu_backend(&self) -> &dyn GpuBackend {
         self.gpu.as_ref()
+    }
+
+    /// Borrow the model config for post-construction wiring (e.g. building the
+    /// DeepSeek-V4 MTP proposer, which needs `hidden_size` / `kv_lora_rank` /
+    /// `qk_rope_head_dim` to size its private MLA KV cache).
+    pub fn config_ref(&self) -> &ModelConfig {
+        &self.config
     }
 
     /// Install a DFlash drafter as the active proposer, replacing whatever
@@ -137,7 +146,7 @@ impl TransformerModel {
     ///   - The seq has no `DflashProposerState`
     ///   - Rank > 0 under EP/TP (drafter is rank-0 only)
     ///
-    /// Layout: writes hidden[t] BF16 into
+    /// Layout: writes `hidden[t]` BF16 into
     /// `acc[(chunk_start + t) * 5 * h + slot_idx * h]` for each t.
     /// Per-layer call performs `proc_count` strided d2d_async copies —
     /// at typical prefill of 128–4096 tokens × 5 capture layers, total
@@ -264,10 +273,8 @@ impl TransformerModel {
         };
         let h = self.config.hidden_size;
         let bf16 = 2usize;
-        debug_assert!(
-            !self.config.use_fp32_residual(),
-            "DFlash hidden capture currently assumes BF16 residual; FP32-residual models need a separate downcast path"
-        );
+        // The residual stream is always BF16, so DFlash hidden capture
+        // copies BF16 bytes directly with no downcast.
         let src = self.buffers.hidden_states().offset(token_idx * h * bf16);
         let dst_slot = dst.offset(slot * h * bf16);
         self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
