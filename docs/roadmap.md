@@ -29,13 +29,12 @@ Expert-Bank OS answers: which physical experts should a logical router slot reso
 | 3 | Attention/KV pressure | issue #5 | adapt context, attention budget, KV cache policy |
 | 4 | Auxiliary co-residency | issue #6 | shrink/recover LLM while hosting aux models |
 | 5 | Elasticity benchmark | issue #7 | sweep operating points and produce frontier profiles |
-| 6 | Expert bank registry | planned | register base, donor, merged, resident, and offloaded experts |
-| 7 | Canonical MoE schema | planned | normalize model-specific expert structures and state_dict keys |
-| 8 | Expert index resolver | planned | map logical router ids to physical expert refs |
-| 9 | Routing profiles | planned | package top-k, mask, remap, bias, fallback, and runtime policy |
-| 10 | Profile materializer | planned | emit normal checkpoints from a profile for MVP testing |
-| 11 | Runtime grafting | planned | dispatch physical experts dynamically without writing checkpoints |
-| 12 | Auto resolver/search | planned | use telemetry, similarity, activation, and eval to build profiles |
+| 6 | Expert bank registry | issue #32 | register base, donor, merged, resident, and offloaded experts |
+| 7 | Canonical MoE schema | issue #33 | normalize model-specific expert structures and state_dict keys |
+| 8 | Expert index resolver | issue #34 | map logical router ids to physical expert refs |
+| 9 | Profile materializer | issue #35 | emit normal checkpoints from a profile for MVP testing |
+| 10 | Runtime grafting | issue #36 | dispatch physical experts dynamically without writing checkpoints |
+| 11 | Auto resolver/search | issue #37 | use telemetry, similarity, activation, and eval to build profiles |
 
 ## Runtime elasticity track
 
