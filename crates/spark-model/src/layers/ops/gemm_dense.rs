@@ -416,7 +416,6 @@ pub fn bf16_to_fp8(
         .launch(stream)
 }
 
-
 pub fn quantize_bf16_to_nvfp4(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -438,7 +437,6 @@ pub fn quantize_bf16_to_nvfp4(
         .arg_u32(k)
         .launch(stream)
 }
-
 
 pub fn w4a4_gemm(
     gpu: &dyn GpuBackend,
