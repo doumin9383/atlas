@@ -270,7 +270,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
 
                     let qkvz_size = config.ssm_qkvz_size();
                     let qkvz_nvfp4 = quantize_to_nvfp4(
-                                                &qkvz_dense,
+                        &qkvz_dense,
                         qkvz_size,
                         h,
                         gpu,
@@ -281,7 +281,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
 
                     let out_proj_nvfp4 = quantize_to_nvfp4(
-                                                &out_proj_dense,
+                        &out_proj_dense,
                         h,
                         value_dim,
                         gpu,
@@ -296,23 +296,23 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             let qkvz_total = (qkvz_size * h) as u32;
                             let qkvz_fp8 = gpu.alloc(qkvz_size * h)?;
                             crate::layers::ops::bf16_to_fp8(
-                                                        gpu,
-                        b2f_k,
-                        qkvz_dense.weight,
-                        qkvz_fp8,
-                        qkvz_total,
-                        stream,
-                            )?;
+                                gpu,
+                                b2f_k,
+                                qkvz_dense.weight,
+                                qkvz_fp8,
+                                qkvz_total,
+                                stream,
+                                )?;
                             let out_total = (h * value_dim) as u32;
                             let out_fp8 = gpu.alloc(h * value_dim)?;
                             crate::layers::ops::bf16_to_fp8(
-                                                        gpu,
-                        b2f_k,
-                        out_proj_dense.weight,
-                        out_fp8,
-                        out_total,
-                        stream,
-                            )?;
+                                gpu,
+                                b2f_k,
+                                out_proj_dense.weight,
+                                out_fp8,
+                                out_total,
+                                stream,
+                                )?;
                             gpu.synchronize(stream)?;
                             (Some(qkvz_fp8), Some(out_fp8))
                         } else {
