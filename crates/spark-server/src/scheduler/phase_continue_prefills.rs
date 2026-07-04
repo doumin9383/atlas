@@ -274,4 +274,3 @@ pub(super) fn continue_in_progress_prefills(
     );
     did_mixed_step
 }
-

@@ -302,7 +302,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                 qkvz_fp8,
                                 qkvz_total,
                                 stream,
-                                )?;
+                            )?;
                             let out_total = (h * value_dim) as u32;
                             let out_fp8 = gpu.alloc(h * value_dim)?;
                             crate::layers::ops::bf16_to_fp8(
@@ -312,7 +312,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                 out_fp8,
                                 out_total,
                                 stream,
-                                )?;
+                            )?;
                             gpu.synchronize(stream)?;
                             (Some(qkvz_fp8), Some(out_fp8))
                         } else {
