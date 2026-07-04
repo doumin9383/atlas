@@ -235,9 +235,6 @@ pub struct TransformerModel {
     /// Embedding scale kernel: embeddings *= sqrt(hidden_size).
     /// KernelHandle(0) = disabled (no scaling for this model).
     pub(super) embed_scale_kernel: KernelHandle,
-    /// Per-request MoE expert top-k override. Set by the scheduler before
-    /// each forward pass. 0 means "use config.num_experts_per_tok".
-    /// Must be ≤ config.num_experts_per_tok (buffer capacity).
 }
 
 /// Pinned host memory staging buffer with reusable metadata Vecs.
