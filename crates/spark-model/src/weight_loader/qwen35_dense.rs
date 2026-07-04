@@ -211,18 +211,24 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         gpu,
                         layer_kv_dtypes[attn_idx],
                         config.fp8_kv_calibration_tokens,
-                        config,
                     )?;
                     if let (Some(qw), Some(kw), Some(vw)) = (q_nvfp4, k_nvfp4, v_nvfp4) {
                         let nh = config.num_attention_heads;
                         let nkv = config.num_key_value_heads;
                         let hd = config.head_dim;
                         let hh = config.hidden_size;
-                        let q_n = if config.attn_gated { nh * hd * 2 } else { nh * hd };
+                        let q_n = if config.attn_gated {
+                            nh * hd * 2
+                        } else {
+                            nh * hd
+                        };
                         let qt = qw.transpose_for_gemm(gpu, q_n, hh)?;
                         let kt = kw.transpose_for_gemm(gpu, nkv * hd, hh)?;
                         let vt = vw.transpose_for_gemm(gpu, nkv * hd, hh)?;
-                        let ot = attn_layer.attn.o_proj.transpose_for_gemm(gpu, hh, nh * hd)?;
+                        let ot = attn_layer
+                            .attn
+                            .o_proj
+                            .transpose_for_gemm(gpu, hh, nh * hd)?;
                         attn_layer.set_prefill_weights(Some(qt), Some(kt), Some(vt), Some(ot));
                     }
                     layers.push(Box::new(attn_layer));
@@ -264,12 +270,24 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
 
                     let qkvz_size = config.ssm_qkvz_size();
                     let qkvz_nvfp4 = quantize_to_nvfp4(
-                        &qkvz_dense, qkvz_size, h, gpu, absmax_k, quantize_k, stream,
+                                                &qkvz_dense,
+                        qkvz_size,
+                        h,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        stream,
                     )?;
                     let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
 
                     let out_proj_nvfp4 = quantize_to_nvfp4(
-                        &out_proj_dense, h, value_dim, gpu, absmax_k, quantize_k, stream,
+                                                &out_proj_dense,
+                        h,
+                        value_dim,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        stream,
                     )?;
                     let out_proj_nvfp4_t = out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?;
 
@@ -278,12 +296,22 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             let qkvz_total = (qkvz_size * h) as u32;
                             let qkvz_fp8 = gpu.alloc(qkvz_size * h)?;
                             crate::layers::ops::bf16_to_fp8(
-                                gpu, b2f_k, qkvz_dense.weight, qkvz_fp8, qkvz_total, stream,
+                                                        gpu,
+                        b2f_k,
+                        qkvz_dense.weight,
+                        qkvz_fp8,
+                        qkvz_total,
+                        stream,
                             )?;
                             let out_total = (h * value_dim) as u32;
                             let out_fp8 = gpu.alloc(h * value_dim)?;
                             crate::layers::ops::bf16_to_fp8(
-                                gpu, b2f_k, out_proj_dense.weight, out_fp8, out_total, stream,
+                                                        gpu,
+                        b2f_k,
+                        out_proj_dense.weight,
+                        out_fp8,
+                        out_total,
+                        stream,
                             )?;
                             gpu.synchronize(stream)?;
                             (Some(qkvz_fp8), Some(out_fp8))
@@ -307,9 +335,15 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     };
 
                     let mut layer = Qwen3SsmLayer::new_sequential(
-                        input_norm, ssm, post_attn_norm, ffn,
-                        Some(qkvz_nvfp4), Some(qkvz_nvfp4_t), Some(out_proj_nvfp4_t),
-                        config, gpu,
+                        input_norm,
+                        ssm,
+                        post_attn_norm,
+                        ffn,
+                        Some(qkvz_nvfp4),
+                        Some(qkvz_nvfp4_t),
+                        Some(out_proj_nvfp4_t),
+                        config,
+                        gpu,
                     )?;
                     layer.predequant_for_prefill(gpu, config, stream)?;
                     if qkvz_fp8_prefill.is_some() || out_proj_fp8_prefill.is_some() {

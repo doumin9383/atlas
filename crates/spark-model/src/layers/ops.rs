@@ -25,8 +25,6 @@ mod fp8_moe_batch_a;
 mod fp8_moe_batch_b;
 #[path = "ops/gemm_dense.rs"]
 mod gemm_dense;
-mod q4k_mmq;
-mod nvfp4_mmq;
 #[path = "ops/gemm_quant.rs"]
 mod gemm_quant;
 #[path = "ops/hyper_connection.rs"]
@@ -51,6 +49,7 @@ mod moe_grouped_b;
 mod moe_prefill;
 #[path = "ops/norm.rs"]
 mod norm;
+mod nvfp4_mmq;
 #[path = "ops/prefill_attn_a.rs"]
 mod prefill_attn_a;
 #[path = "ops/prefill_attn_b.rs"]
@@ -65,6 +64,7 @@ mod prefill_attn_main_a;
 mod prefill_attn_main_b;
 #[path = "ops/prefill_attn_turbok.rs"]
 mod prefill_attn_turbok;
+mod q4k_mmq;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 #[path = "ops/sampling.rs"]
@@ -87,8 +87,6 @@ pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
 pub use gemm_dense::*;
-pub use q4k_mmq::*;
-pub use nvfp4_mmq::*;
 pub use gemm_quant::*;
 pub use hyper_connection::*;
 pub use kv_cache::*;
@@ -102,6 +100,7 @@ pub use moe_grouped_a::*;
 pub(crate) use moe_grouped_b::*;
 pub use moe_prefill::*;
 pub use norm::*;
+pub use nvfp4_mmq::*;
 pub use prefill_attn_a::*;
 pub use prefill_attn_b::*;
 pub use prefill_attn_batched::*;
@@ -109,6 +108,7 @@ pub use prefill_attn_fp8k::*;
 pub use prefill_attn_main_a::*;
 pub use prefill_attn_main_b::*;
 pub use prefill_attn_turbok::*;
+pub use q4k_mmq::*;
 pub use quant_dispatch::*;
 pub use sampling::*;
 pub use ssm_gdn_a::*;

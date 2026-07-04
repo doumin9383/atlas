@@ -304,7 +304,6 @@ impl InferenceRequest {
             InferenceRequest::Streaming { timeout_at, .. } => *timeout_at,
         }
     }
-
 }
 
 /// Tokenize stop sequence strings into single-token stop IDs.

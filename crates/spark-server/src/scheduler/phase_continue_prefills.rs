@@ -272,7 +272,6 @@ pub(super) fn continue_in_progress_prefills(
         tool_call_start_token,
         tool_call_end_token,
     );
-
     did_mixed_step
 }
 

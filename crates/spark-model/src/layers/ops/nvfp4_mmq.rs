@@ -12,7 +12,7 @@
 // then MMQ → bf16 out; scale2 folded in the SiLU-mul.
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kernel_args::{div_ceil, KernelLaunch};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 /// NVFP4 block: 64 weights -> 36-byte block_nvfp4 {4×ue4m3 scales, 32B e2m1 nibbles}.
 pub const QK_NVFP4: u32 = 64;

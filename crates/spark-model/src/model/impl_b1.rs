@@ -274,9 +274,7 @@ impl TransformerModel {
                 gdn_exact_replay: false,
                 token_ids: None,
             }
-
         };
-
 
         // Diagnostic: dump hidden state for first 2 decode tokens after prefill
         let diag = seq.seq_len < seq.tokens.len() + 2;
