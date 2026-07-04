@@ -415,3 +415,55 @@ pub fn bf16_to_fp8(
         .arg_u32(total_elements)
         .launch(stream)
 }
+
+
+pub fn quantize_bf16_to_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([m, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(1.0) // scale2 = 1.0 (single-level; activation range fits E4M3 group scales)
+        .arg_u32(m) // kernel's N param = rows = tokens
+        .arg_u32(k)
+        .launch(stream)
+}
+
+
+pub fn w4a4_gemm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_ptr(output)
+        .arg_f32(1.0) // scaleA2 (activation single-level)
+        .arg_f32(weight.weight_scale_2) // scaleB2 (weight per-tensor)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}

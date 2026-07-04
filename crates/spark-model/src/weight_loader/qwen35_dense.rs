@@ -211,6 +211,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         gpu,
                         layer_kv_dtypes[attn_idx],
                         config.fp8_kv_calibration_tokens,
+                        config,
                     )?;
                     if let (Some(qw), Some(kw), Some(vw)) = (q_nvfp4, k_nvfp4, v_nvfp4) {
                         let nh = config.num_attention_heads;

@@ -592,6 +592,32 @@ pub fn w8a16_gemm_t(
         .launch(stream)
 }
 
+pub fn w8a16_gemm_n128_m128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight_t: DevicePtr,      // [K, N] FP8 transposed
+    block_scale_t: DevicePtr, // [K/128, N/128] FP32 transposed
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemm_t_m128", m, n, k);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_t)
+        .arg_ptr(block_scale_t)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Pipelined transposed W8A16 GEMM (kernel `w8a16_gemm_t_pipelined`): same
 /// transposed args as `w8a16_gemm_t`, ~4.2x via smem-LUT + K_STEP32 +
 /// K-contiguous smem_B + 128x32 occupancy tile.
