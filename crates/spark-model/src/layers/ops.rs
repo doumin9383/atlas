@@ -119,3 +119,9 @@ pub use ssm_gdn_b::*;
 pub use ssm_gdn_batched::*;
 pub use ssm_mamba::*;
 pub use ssm_preproc::*;
+
+/// Log the dimensions of a GEMM operation at trace level (debug).
+#[inline(always)]
+pub(crate) fn log_gemm_shape(name: &str, m: u32, n: u32, k: u32) {
+    tracing::trace!("{name}(m={m}, n={n}, k={k})");
+}
