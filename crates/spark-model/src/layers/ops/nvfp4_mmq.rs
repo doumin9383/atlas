@@ -100,7 +100,11 @@ pub fn nvfp4_mmq_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let kernel = if !n.is_multiple_of(128) { kernel_wc } else { kernel_nc };
+    let kernel = if !n.is_multiple_of(128) {
+        kernel_wc
+    } else {
+        kernel_nc
+    };
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([32, 8, 1])
