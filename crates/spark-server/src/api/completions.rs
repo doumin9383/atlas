@@ -146,7 +146,7 @@ pub async fn completions(
             .collect()
     });
     let stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);
-    spark_model::moe_top_k::set(req.moe_top_k.unwrap_or(0));
+    spark_model::moe_top_k::set(0); // default = model config
 
     if req.stream {
         return match completions_stream(
