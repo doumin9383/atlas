@@ -11,10 +11,9 @@ use crate::layer::TransformerLayer;
 use crate::layers::{DenseFfnLayer, FfnComponent, Qwen3AttentionLayer, Qwen3SsmLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, SsmWeights, dense,
-    dense_auto, dense_f32_safe, dense_keep_f32, dequant_nvfp4_to_bf16, detect_nvfp4_variant,
-    gpu_concat_rows, interleave_ba, load_dense_ffn,
-    load_kv_scales, load_mtp, quantize_to_nvfp4, quantized_auto,
+    AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, SsmWeights, dense, dense_auto,
+    dense_f32_safe, dense_keep_f32, dequant_nvfp4_to_bf16, detect_nvfp4_variant, gpu_concat_rows,
+    interleave_ba, load_dense_ffn, load_kv_scales, load_mtp, quantize_to_nvfp4, quantized_auto,
 };
 
 mod loaders_b;
